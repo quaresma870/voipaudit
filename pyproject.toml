@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "voipaudit"
+version = "0.1.0"
+description = "Authorized SIP/VoIP security auditing — PBX fingerprinting, REGISTER exposure checks, and more"
+requires-python = ">=3.11"
+dependencies = ["click>=8.1.0", "rich>=13.7.0", "pyyaml>=6.0.1"]
+
+[project.optional-dependencies]
+dashboard = ["fastapi>=0.110.0", "uvicorn>=0.29.0"]
+
+[project.scripts]
+voipaudit = "voipaudit.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["voipaudit*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP"]
+ignore = ["E501"]

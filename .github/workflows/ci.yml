@@ -1,0 +1,153 @@
+name: CI
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+      - run: pip install ruff
+      - run: ruff check .
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    needs: lint
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Run tests
+        run: PYTHONPATH=. pytest tests/ -v --tb=short
+
+  build:
+    name: Build package
+    runs-on: ubuntu-latest
+    needs: lint
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+      - run: pip install build twine
+      - name: Build wheel and sdist
+        run: python -m build
+      - name: Check package metadata
+        run: twine check dist/*
+      - name: Install built wheel in a clean venv
+        run: |
+          python -m venv /tmp/smoke-venv
+          /tmp/smoke-venv/bin/pip install "$(echo dist/*.whl)"
+          /tmp/smoke-venv/bin/voipaudit --version
+          /tmp/smoke-venv/bin/voipaudit --help
+
+      - name: "Integration test: real commands against a real mock SIP server"
+        # Adopted from the very first commit, not discovered later
+        # through an audit: no CI job here should ever be able to pass
+        # without actually building, installing, and running the real
+        # package — this is exactly the gap that let a real,
+        # ship-breaking bug (a wrong build-backend in pyproject.toml)
+        # go undetected in the sibling loganalyzer repo, found only
+        # during a later audit.
+        run: |
+          set -euo pipefail
+          VA=/tmp/smoke-venv/bin/voipaudit
+          WORK=$(mktemp -d)
+          cd "$WORK"
+
+          echo "::group::Start a real mock SIP server (real UDP socket)"
+          PYTHONPATH="$GITHUB_WORKSPACE" python3 -c "
+          import sys, time
+          sys.path.insert(0, '$GITHUB_WORKSPACE')
+          from tests.fixtures.mock_pbx.server import start_mock_pbx
+          server = start_mock_pbx(server_header='Asterisk PBX 18.9.0', accept_unauthenticated_register=True)
+          with open('/tmp/mock_pbx_port.txt', 'w') as f:
+              f.write(str(server.port))
+          with open('/tmp/mock_pbx_tcp_port.txt', 'w') as f:
+              f.write(str(server.tcp_port))
+          time.sleep(60)
+          " > /tmp/mock_pbx.log 2>&1 &
+          MOCK_PID=$!
+          sleep 2
+          PORT=$(cat /tmp/mock_pbx_port.txt)
+          echo "Mock PBX on port $PORT"
+          echo "::endgroup::"
+
+          echo "::group::init, validate-scope"
+          $VA init --output authorization.yml
+          python3 -c "
+          import datetime, yaml
+          now = datetime.datetime.now(datetime.timezone.utc)
+          data = {
+              'engagement_id': 'ci-integration-test',
+              'authorized_by': 'CI', 'authorized_contact_email': 'ci@example.com',
+              'client': 'CI Integration Test',
+              'scope': {'targets': ['127.0.0.1'], 'excluded_targets': [], 'allowed_categories': ['recon', 'active']},
+              'window': {
+                  'start': (now - datetime.timedelta(hours=1)).isoformat(),
+                  'end': (now + datetime.timedelta(days=1)).isoformat(),
+              },
+              'confirmation_phrase': 'I confirm authorization for ci-integration-test',
+          }
+          with open('authorization.yml', 'w') as f:
+              yaml.safe_dump(data, f)
+          "
+          $VA validate-scope
+          echo "::endgroup::"
+
+          echo "::group::scan — pbx_fingerprint (recon, real detection)"
+          OUTPUT=$($VA scan "127.0.0.1:$PORT" --modules pbx_fingerprint)
+          echo "$OUTPUT"
+          echo "$OUTPUT" | grep -q "Asterisk" || (echo "expected Asterisk fingerprint not found" && exit 1)
+          echo "::endgroup::"
+
+          echo "::group::scan — register_exposed refused without --confirm"
+          set +e
+          $VA scan "127.0.0.1:$PORT" --modules register_exposed
+          CODE=$?
+          set -e
+          if [ "$CODE" -eq 0 ]; then
+            echo "register_exposed should have been refused without --confirm"
+            exit 1
+          fi
+          echo "::endgroup::"
+
+          echo "::group::scan — register_exposed with --confirm (real CRITICAL detection)"
+          # register_exposed exits 1 when it finds a CRITICAL finding
+          # (by design, so a real CI pipeline scanning production VoIP
+          # infra can fail on it) — the vulnerable mock PBX is exactly
+          # such a case, so THIS exit is expected here, hence || true.
+          # Confirmed this matters for real: the same set -e trap
+          # already found and fixed in the sibling secureaudit and
+          # redteam-toolkit repos' own CI scripts.
+          OUTPUT=$($VA scan "127.0.0.1:$PORT" --modules register_exposed --confirm ci-integration-test || true)
+          echo "$OUTPUT"
+          echo "$OUTPUT" | grep -q "CRITICAL" || (echo "expected CRITICAL finding for the vulnerable mock PBX not found" && exit 1)
+          echo "::endgroup::"
+
+          echo "::group::scan — same checks again, over --transport tcp"
+          TCP_PORT=$(cat /tmp/mock_pbx_tcp_port.txt)
+          OUTPUT=$($VA scan "127.0.0.1:$TCP_PORT" --modules pbx_fingerprint --transport tcp)
+          echo "$OUTPUT"
+          echo "$OUTPUT" | grep -q "Asterisk" || (echo "expected Asterisk fingerprint over TCP not found" && exit 1)
+          OUTPUT=$($VA scan "127.0.0.1:$TCP_PORT" --modules register_exposed --confirm ci-integration-test --transport tcp || true)
+          echo "$OUTPUT"
+          echo "$OUTPUT" | grep -q "CRITICAL" || (echo "expected CRITICAL finding over TCP not found" && exit 1)
+          echo "::endgroup::"
+
+          kill $MOCK_PID 2>/dev/null || true
+          echo "All integration checks passed."
