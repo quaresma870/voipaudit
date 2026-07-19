@@ -102,7 +102,16 @@ jobs:
 
           echo "::group::init, validate-scope"
           $VA init --output authorization.yml
-          python3 -c "
+          # Uses the smoke-venv's own python3, not the bare system one --
+          # pyyaml is a dependency of voipaudit itself (installed into
+          # the venv), but this job's system interpreter only ever had
+          # `pip install build twine` run against it, which doesn't pull
+          # in pyyaml as a transitive dependency. The same class of gap
+          # already found and fixed in the sibling redteam-toolkit repo's
+          # own CI script -- confirmed here for real via the ::error::
+          # trap above (line-number annotation), not assumed from that
+          # precedent alone.
+          /tmp/smoke-venv/bin/python3 -c "
           import datetime, yaml
           now = datetime.datetime.now(datetime.timezone.utc)
           data = {
