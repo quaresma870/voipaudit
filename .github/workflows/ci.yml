@@ -64,12 +64,14 @@ jobs:
         # go undetected in the sibling loganalyzer repo, found only
         # during a later audit.
         run: |
-          set -euo pipefail
+          set -uo pipefail
+          trap 'echo "::error::Integration test failed at line $LINENO: $BASH_COMMAND"' ERR
+          set -e
           VA=/tmp/smoke-venv/bin/voipaudit
           WORK=$(mktemp -d)
           cd "$WORK"
 
-          echo "::group::Start a real mock SIP server (real UDP socket)"
+          echo "::group::Start a real mock SIP server (real UDP+TCP sockets)"
           PYTHONPATH="$GITHUB_WORKSPACE" python3 -c "
           import sys, time
           sys.path.insert(0, '$GITHUB_WORKSPACE')
@@ -79,12 +81,23 @@ jobs:
               f.write(str(server.port))
           with open('/tmp/mock_pbx_tcp_port.txt', 'w') as f:
               f.write(str(server.tcp_port))
-          time.sleep(60)
+          time.sleep(90)
           " > /tmp/mock_pbx.log 2>&1 &
           MOCK_PID=$!
-          sleep 2
+          for i in $(seq 1 20); do
+            if [ -f /tmp/mock_pbx_port.txt ] && [ -f /tmp/mock_pbx_tcp_port.txt ]; then
+              break
+            fi
+            sleep 0.5
+          done
+          if [ ! -f /tmp/mock_pbx_port.txt ]; then
+            echo "::error::Mock PBX never wrote its port file. Log:"
+            cat /tmp/mock_pbx.log || true
+            exit 1
+          fi
           PORT=$(cat /tmp/mock_pbx_port.txt)
-          echo "Mock PBX on port $PORT"
+          TCP_PORT=$(cat /tmp/mock_pbx_tcp_port.txt)
+          echo "Mock PBX — UDP: $PORT, TCP: $TCP_PORT (pid $MOCK_PID)"
           echo "::endgroup::"
 
           echo "::group::init, validate-scope"
@@ -140,7 +153,6 @@ jobs:
           echo "::endgroup::"
 
           echo "::group::scan — same checks again, over --transport tcp"
-          TCP_PORT=$(cat /tmp/mock_pbx_tcp_port.txt)
           OUTPUT=$($VA scan "127.0.0.1:$TCP_PORT" --modules pbx_fingerprint --transport tcp)
           echo "$OUTPUT"
           echo "$OUTPUT" | grep -q "Asterisk" || (echo "expected Asterisk fingerprint over TCP not found" && exit 1)
