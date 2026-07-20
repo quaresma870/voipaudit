@@ -191,5 +191,13 @@ jobs:
           echo "$OUTPUT" | grep -q "Plaintext SIP still accepted" || (echo "expected plaintext-alongside-TLS finding not found" && exit 1)
           echo "::endgroup::"
 
+          echo "::group::analyze-cdr — real toll-fraud detection against the real fixture CDR"
+          OUTPUT=$($VA analyze-cdr "$GITHUB_WORKSPACE/tests/fixtures/cdr/sample_master.csv" || true)
+          echo "$OUTPUT"
+          echo "$OUTPUT" | grep -q "high-risk destination" || (echo "expected high-risk-destination finding not found" && exit 1)
+          echo "$OUTPUT" | grep -q "Off-hours" || (echo "expected off-hours finding not found" && exit 1)
+          echo "$OUTPUT" | grep -q "burst" || (echo "expected burst finding not found" && exit 1)
+          echo "::endgroup::"
+
           kill $MOCK_PID 2>/dev/null || true
           echo "All integration checks passed."

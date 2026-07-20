@@ -23,20 +23,32 @@ shift based on what turns out to matter most in practice.
   documented command against a real mock SIP server for all three
   transports.
 
+### v0.2.0
+- `analyze-cdr` — parses a real Asterisk CDR CSV export (field order and
+  format confirmed against Asterisk's own documentation and cdr_csv.c
+  source, not invented) and detects three patterns indicative of toll
+  fraud already having occurred:
+  - Calls to known high-risk international destinations. Sourced from
+    two structurally-durable categories (satellite/premium-network
+    prefixes; NANP numbers formatted to look domestic but that are
+    actually expensive international destinations — the classic
+    Wangiri target set) plus a few illustrative, currently-documented
+    examples from a real, dated fraud report. Explicitly documented as
+    non-exhaustive — industry fraud reporting is clear that premium-rate
+    traffic spans 200+ countries and shifts monthly.
+  - Off-hours call bursts from a single extension.
+  - Rapid repeated short calls from a single extension.
+  File-analysis only — no Authorization/Engagement gate, since no live
+  target is touched. Verified against real, hand-crafted CDR test data
+  covering both the fraud patterns and ordinary business calls (to
+  confirm no false positives on legitimate traffic).
+
 ## Next
 
-### Toll fraud — two distinct features, deliberately split
-"Toll fraud detection" turned out to mean two genuinely different things,
-worth building as separate, differently-shaped features rather than one:
+The live toll-fraud **exposure** check (as opposed to the CDR analysis
+above, which detects fraud that may have already happened) is what's
+left of the original "toll fraud detection" idea:
 
-- **CDR/log analysis** (input: a call-detail-record export, e.g.
-  Asterisk's own CDR CSV format) — parses real call records and flags
-  patterns indicative of fraud already having occurred: bursts of calls
-  to high-cost international destinations, unusual-hour call volume,
-  rapid repeated short calls from one extension. This is a file-analysis
-  feature, not a live network probe — no Authorization/Engagement gate
-  needed the way live scanning modules require, since there's no live
-  target being touched.
 - **Live exposure check** (a `toll_fraud_exposure`-style recon module) —
   checks whether the PBX's *current configuration* would even allow toll
   fraud to happen, independent of whether it already has. Likely needs
