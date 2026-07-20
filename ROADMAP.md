@@ -43,11 +43,30 @@ shift based on what turns out to matter most in practice.
   covering both the fraud patterns and ordinary business calls (to
   confirm no false positives on legitimate traffic).
 
+### v0.3.0
+- `analyze-pcap` — reconstructs SIP call sessions directly from a packet
+  capture (INVITE → final response → BYE, correlated by Call-ID, using
+  the same duration/billsec semantics as Asterisk's own CDR) and runs the
+  exact same `analyze_toll_fraud()` used by `analyze-cdr`, with zero
+  changes to that function — confirming pcap parsing is a genuine
+  drop-in alternative data source, not a parallel/divergent analysis
+  path. Works against effectively any SBC/PBX vendor's traffic, not just
+  Asterisk, since SIP itself (not any particular CDR export format) is
+  what every one of them speaks on the wire. New optional `pcap` extra
+  (scapy) keeps the base install lean for users who only want live
+  scanning. Only UDP SIP transport is parsed in this first version — TCP
+  pcap support is a tracked gap below.
+- `core/sip_message.py` — a new general-purpose SIP message parser
+  (handles both requests and responses) for arbitrary captured traffic,
+  deliberately kept separate from `core/sip.py`'s own SipMessage type
+  (which specifically represents a response to a request this tool
+  itself sent during live scanning, not arbitrary bidirectional traffic).
+
 ## Next
 
-The live toll-fraud **exposure** check (as opposed to the CDR analysis
-above, which detects fraud that may have already happened) is what's
-left of the original "toll fraud detection" idea:
+The live toll-fraud **exposure** check (as opposed to the CDR/pcap
+analysis above, which detects fraud that may have already happened) is
+what's left of the original "toll fraud detection" idea:
 
 - **Live exposure check** (a `toll_fraud_exposure`-style recon module) —
   checks whether the PBX's *current configuration* would even allow toll
@@ -57,6 +76,15 @@ left of the original "toll fraud detection" idea:
   active-tier probe than anything shipped so far (a real INVITE can
   actually ring a phone or incur cost) — needs careful, conservative
   design before this ships, not a quick add.
+
+### TCP pcap support
+`analyze-pcap` only extracts UDP payloads in this first version — the
+overwhelming majority of real-world SIP trunk traffic is UDP, but a TCP
+capture (or a mixed one) currently has its TCP-carried SIP messages
+silently missed. TCP SIP reassembly (handling messages split or
+coalesced across TCP segments, unlike UDP's one-datagram-one-message
+guarantee) is a real, separate parsing problem worth its own careful
+implementation, not a quick follow-on to the UDP path.
 
 ### SRTP media encryption checks
 `transport_security` covers *signalling* encryption (TLS/SIPS). Media

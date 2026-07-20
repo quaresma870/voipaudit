@@ -2,6 +2,7 @@ click>=8.1.0
 rich>=13.7.0
 pyyaml>=6.0.1
 cryptography>=42.0.0    # TLS certificate parsing — transport_security plugin
+scapy>=2.5.0            # optional: pcap analysis — pip install voipaudit[pcap]
 fastapi>=0.110.0        # optional: dashboard — pip install voipaudit[dashboard]
 uvicorn>=0.29.0
 

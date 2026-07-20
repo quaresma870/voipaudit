@@ -41,6 +41,12 @@ TCP, and TLS) plus a file-analysis command:
   known high-risk international destinations, off-hours call bursts, and
   rapid repeated short calls from one extension. File-analysis only, no
   live target touched — no authorization.yml needed for this command.
+- **`analyze-pcap`** — reconstructs SIP call sessions directly from a
+  packet capture and runs the exact same toll-fraud analysis as
+  `analyze-cdr` — works against effectively any SBC/PBX vendor's traffic
+  (SIP itself is the standard, not any particular CDR export format),
+  not just Asterisk. Requires the optional `pcap` extra
+  (`pip install voipaudit[pcap]`).
 
 All three live-scan transports (`--transport udp` / `tcp` / `tls`, UDP by
 default; `--insecure` to skip certificate verification for a self-signed
@@ -123,6 +129,24 @@ test data in `tests/fixtures/cdr/sample_master.csv`:
 - Rapid repeated short calls from a single extension (an
   automated-dialer/compromised-extension signature).
 
+### From a packet capture instead
+
+```bash
+pip install voipaudit[pcap]
+voipaudit analyze-pcap capture.pcap
+voipaudit analyze-pcap capture.pcap --json findings.json
+```
+
+Reconstructs SIP call sessions (INVITE → final response → BYE, correlated
+by Call-ID) directly from captured traffic and feeds them into the exact
+same `analyze_toll_fraud()` used by `analyze-cdr` — no changes needed to
+the analysis logic itself, since the output is the same `CDRRecord`
+shape either way. This works against any SBC/PBX vendor's traffic, not
+just Asterisk, since SIP itself (not any particular CDR export format)
+is what every one of them actually speaks on the wire. Only UDP SIP
+transport is parsed in this first version — see
+[ROADMAP.md](ROADMAP.md).
+
 This is a genuinely different feature from `scan`'s live probing — see
 [ROADMAP.md](ROADMAP.md) for why toll-fraud detection was deliberately
 split into this file-analysis feature and a separate, not-yet-built live
@@ -145,14 +169,16 @@ entries).
 ```
 voipaudit/
 ├── voipaudit/
-│   ├── cli.py                    # init, validate-scope, scan, list-plugins, analyze-cdr
+│   ├── cli.py                    # init, validate-scope, scan, list-plugins, analyze-cdr, analyze-pcap
 │   ├── core/
 │   │   ├── authorization.py      # Authorization/Scope/Window — the scope gate's data model
 │   │   ├── engagement.py         # Engagement — ties Authorization + audit log together
 │   │   ├── audit_log.py          # hash-chained, append-only audit log
 │   │   ├── rate_limit.py         # conservative SIP-specific rate budget defaults
 │   │   ├── sip.py                # raw SIP (RFC 3261) message construction/parsing/transport
+│   │   ├── sip_message.py        # general SIP message parsing (requests + responses) for captured traffic
 │   │   ├── cdr.py                # Asterisk CDR CSV parsing
+│   │   ├── pcap_parser.py        # pcap → SIP call session reconstruction → CDRRecord
 │   │   └── models.py             # Finding, Severity, ModuleResult
 │   ├── plugins/
 │   │   ├── base.py               # BasePlugin — every plugin's scan() must call authorize_action()
@@ -167,7 +193,8 @@ voipaudit/
 │   ├── fixtures/mock_pbx/server.py   # a real UDP+TCP+TLS SIP server, for tests only
 │   ├── fixtures/cdr/sample_master.csv
 │   ├── test_voipaudit.py
-│   └── test_toll_fraud.py
+│   ├── test_toll_fraud.py
+│   └── test_pcap_analysis.py     # pcap files generated programmatically via scapy within the tests
 └── .github/workflows/ci.yml
 ```
 

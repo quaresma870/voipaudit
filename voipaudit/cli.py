@@ -257,6 +257,64 @@ def analyze_cdr(cdr_file, business_start_hour, business_end_hour, json_output):
         sys.exit(1)
 
 
+@cli.command(name="analyze-pcap")
+@click.argument("pcap_file", type=click.Path(exists=True))
+@click.option("--business-start-hour", default=7, show_default=True, type=int,
+              help="Hour (0-23) business hours start — calls before this are 'off-hours'.")
+@click.option("--business-end-hour", default=21, show_default=True, type=int,
+              help="Hour (0-23) business hours end — calls at/after this are 'off-hours'.")
+@click.option("--json", "json_output", default=None, type=click.Path(),
+              help="Also write findings as JSON to this path.")
+def analyze_pcap(pcap_file, business_start_hour, business_end_hour, json_output):
+    """Analyze a packet capture (pcap/pcapng) for toll-fraud patterns.
+
+    Reconstructs SIP call sessions directly from captured traffic and
+    runs the exact same toll-fraud analysis as `analyze-cdr` — this
+    works against effectively any SBC/PBX vendor's traffic (SIP itself
+    is the standard, not any particular CDR export format), not just
+    Asterisk. Requires the optional 'pcap' extra: pip install
+    voipaudit[pcap].
+
+    File-analysis only — no live target is touched, so no
+    authorization.yml or Engagement gate is needed here, matching
+    `analyze-cdr`'s own reasoning.
+    """
+    from voipaudit.analyzers.toll_fraud import analyze_toll_fraud
+    from voipaudit.core.models import ModuleResult
+    from voipaudit.core.pcap_parser import PcapParseError, parse_pcap_to_call_records
+    from voipaudit.reports.terminal import print_results
+
+    try:
+        records = parse_pcap_to_call_records(pcap_file)
+    except PcapParseError as exc:
+        console.print(f"[red]✘ Could not parse {pcap_file}:[/red] {exc}")
+        sys.exit(1)
+
+    if not records:
+        console.print(
+            f"[yellow]⚠[/yellow] {pcap_file} parsed successfully but no complete SIP call "
+            f"(INVITE + a final response) was found in it."
+        )
+        sys.exit(0)
+
+    console.print(f"[green]✔[/green] Reconstructed {len(records)} call record(s) from {pcap_file}\n")
+
+    result = analyze_toll_fraud(
+        records, source_label=pcap_file,
+        business_start_hour=business_start_hour, business_end_hour=business_end_hour,
+    )
+    print_results(pcap_file, [ModuleResult(module="toll_fraud_pcap", findings=result.findings)])
+
+    if json_output:
+        import json as json_module
+        with open(json_output, "w") as f:
+            json_module.dump([f.to_dict() for f in result.findings], f, indent=2)
+        console.print(f"[green]✔[/green] Wrote {len(result.findings)} finding(s) to {json_output}")
+
+    if any(f.severity.value in ("CRITICAL", "HIGH") for f in result.findings):
+        sys.exit(1)
+
+
 def main():
     cli()
 
