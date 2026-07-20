@@ -71,7 +71,7 @@ jobs:
           WORK=$(mktemp -d)
           cd "$WORK"
 
-          echo "::group::Start a real mock SIP server (real UDP+TCP sockets)"
+          echo "::group::Start a real mock SIP server (real UDP+TCP+TLS sockets)"
           PYTHONPATH="$GITHUB_WORKSPACE" python3 -c "
           import sys, time
           sys.path.insert(0, '$GITHUB_WORKSPACE')
@@ -81,11 +81,13 @@ jobs:
               f.write(str(server.port))
           with open('/tmp/mock_pbx_tcp_port.txt', 'w') as f:
               f.write(str(server.tcp_port))
+          with open('/tmp/mock_pbx_tls_port.txt', 'w') as f:
+              f.write(str(server.tls_port))
           time.sleep(90)
           " > /tmp/mock_pbx.log 2>&1 &
           MOCK_PID=$!
           for i in $(seq 1 20); do
-            if [ -f /tmp/mock_pbx_port.txt ] && [ -f /tmp/mock_pbx_tcp_port.txt ]; then
+            if [ -f /tmp/mock_pbx_port.txt ] && [ -f /tmp/mock_pbx_tcp_port.txt ] && [ -f /tmp/mock_pbx_tls_port.txt ]; then
               break
             fi
             sleep 0.5
@@ -97,7 +99,8 @@ jobs:
           fi
           PORT=$(cat /tmp/mock_pbx_port.txt)
           TCP_PORT=$(cat /tmp/mock_pbx_tcp_port.txt)
-          echo "Mock PBX — UDP: $PORT, TCP: $TCP_PORT (pid $MOCK_PID)"
+          TLS_PORT=$(cat /tmp/mock_pbx_tls_port.txt)
+          echo "Mock PBX — UDP: $PORT, TCP: $TCP_PORT, TLS: $TLS_PORT (pid $MOCK_PID)"
           echo "::endgroup::"
 
           echo "::group::init, validate-scope"
@@ -168,6 +171,24 @@ jobs:
           OUTPUT=$($VA scan "127.0.0.1:$TCP_PORT" --modules register_exposed --confirm ci-integration-test --transport tcp || true)
           echo "$OUTPUT"
           echo "$OUTPUT" | grep -q "CRITICAL" || (echo "expected CRITICAL finding over TCP not found" && exit 1)
+          echo "::endgroup::"
+
+          echo "::group::scan — same checks again, over --transport tls --insecure"
+          OUTPUT=$($VA scan "127.0.0.1:$TLS_PORT" --modules pbx_fingerprint --transport tls --insecure)
+          echo "$OUTPUT"
+          echo "$OUTPUT" | grep -q "Asterisk" || (echo "expected Asterisk fingerprint over TLS not found" && exit 1)
+          OUTPUT=$($VA scan "127.0.0.1:$TLS_PORT" --modules register_exposed --confirm ci-integration-test --transport tls --insecure || true)
+          echo "$OUTPUT"
+          echo "$OUTPUT" | grep -q "CRITICAL" || (echo "expected CRITICAL finding over TLS not found" && exit 1)
+          echo "::endgroup::"
+
+          echo "::group::scan — transport_security (real cert inspection, real plaintext-alongside-TLS detection)"
+          OUTPUT=$($VA scan "127.0.0.1" --modules transport_security --insecure \
+            --tls-port "$TLS_PORT" --plaintext-port "$PORT")
+          echo "$OUTPUT"
+          echo "$OUTPUT" | grep -q "TLS offered" || (echo "expected 'TLS offered' finding not found" && exit 1)
+          echo "$OUTPUT" | grep -q "certificate validity OK" || (echo "expected valid-certificate finding not found" && exit 1)
+          echo "$OUTPUT" | grep -q "Plaintext SIP still accepted" || (echo "expected plaintext-alongside-TLS finding not found" && exit 1)
           echo "::endgroup::"
 
           kill $MOCK_PID 2>/dev/null || true

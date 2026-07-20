@@ -1,8 +1,8 @@
 """
-A real, minimal UDP+TCP SIP server — FOR TESTS ONLY.
+A real, minimal UDP+TCP+TLS SIP server — FOR TESTS ONLY.
 
-Responds to real SIP OPTIONS and REGISTER requests over both real UDP
-and real TCP sockets, exactly like a real PBX would, with configurable
+Responds to real SIP OPTIONS and REGISTER requests over real UDP, TCP,
+and TLS sockets, exactly like a real PBX would, with configurable
 behavior so tests can exercise both a securely-configured target
 (challenges REGISTER with 401) and a vulnerable one (accepts an
 unauthenticated REGISTER with 200 OK) — matching the same "test
@@ -10,21 +10,30 @@ against a real protocol implementation, not a mock/assumption" pattern
 already established across this whole portfolio (e.g. redteam-toolkit's
 own tests/fixtures/mock_target).
 
-UDP and TCP listen on two separate, independently-assigned ephemeral
-ports (self.port / self.tcp_port) — real PBX deployments commonly
-listen on the *same* port number for both transports, but since this
-mock uses OS-assigned ephemeral ports for test isolation, there's no
-reliable way to request the identical number on both a UDP and a TCP
-socket, and no test here actually needs that to be true.
+TLS uses a real, openssl-generated self-signed certificate
+(certs/cert.pem + certs/key.pem, checked into this fixtures directory,
+not created on the fly) — this is a TEST-ONLY certificate for
+127.0.0.1/localhost, never used for anything but this mock server.
+
+UDP, TCP, and TLS each listen on their own independently-assigned
+ephemeral port (self.port / self.tcp_port / self.tls_port) — real PBX
+deployments commonly listen on the *same* port number across
+transports, but since this mock uses OS-assigned ephemeral ports for
+test isolation, there's no reliable way to request the identical
+number across all three socket types, and no test here actually needs
+that to be true.
 """
 
 from __future__ import annotations
 
 import re
 import socket
+import ssl
 import threading
+from pathlib import Path
 
 _STATUS_LINE_RE = re.compile(r"^([A-Z]+)\s+sip:")
+_CERTS_DIR = Path(__file__).parent / "certs"
 
 
 class MockPBXServer:
@@ -48,9 +57,20 @@ class MockPBXServer:
         self._tcp_sock.listen(8)
         self.tcp_port = self._tcp_sock.getsockname()[1]
 
+        self._tls_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._tls_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._tls_sock.bind((host, 0))
+        self._tls_sock.listen(8)
+        self.tls_port = self._tls_sock.getsockname()[1]
+        self._tls_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        self._tls_context.load_cert_chain(
+            certfile=str(_CERTS_DIR / "cert.pem"), keyfile=str(_CERTS_DIR / "key.pem")
+        )
+
         self._running = False
         self._udp_thread: threading.Thread | None = None
         self._tcp_thread: threading.Thread | None = None
+        self._tls_thread: threading.Thread | None = None
 
     def start(self) -> None:
         self._running = True
@@ -58,11 +78,14 @@ class MockPBXServer:
         self._udp_thread.start()
         self._tcp_thread = threading.Thread(target=self._serve_tcp_forever, daemon=True)
         self._tcp_thread.start()
+        self._tls_thread = threading.Thread(target=self._serve_tls_forever, daemon=True)
+        self._tls_thread.start()
 
     def stop(self) -> None:
         self._running = False
         self._sock.close()
         self._tcp_sock.close()
+        self._tls_sock.close()
 
     def _serve_udp_forever(self) -> None:
         while self._running:
@@ -84,6 +107,22 @@ class MockPBXServer:
             except OSError:
                 break  # listening socket closed
             threading.Thread(target=self._handle_tcp_connection, args=(conn,), daemon=True).start()
+
+    def _serve_tls_forever(self) -> None:
+        while self._running:
+            try:
+                conn, _addr = self._tls_sock.accept()
+            except OSError:
+                break  # listening socket closed
+            try:
+                tls_conn = self._tls_context.wrap_socket(conn, server_side=True)
+            except ssl.SSLError:
+                conn.close()  # e.g. a plain (non-TLS) probe hit this port — not a crash-worthy event
+                continue
+            # Once handshaked, an SSLSocket exposes the same
+            # settimeout/recv/sendall surface a plain TCP socket does,
+            # so the exact same connection handler is reused unchanged.
+            threading.Thread(target=self._handle_tcp_connection, args=(tls_conn,), daemon=True).start()
 
     def _handle_tcp_connection(self, conn: socket.socket) -> None:
         try:

@@ -201,6 +201,48 @@ class TestSipProtocol:
             listener.close()
             thread.join(timeout=2.0)
 
+    def test_send_sip_request_real_tls_round_trip_insecure(self):
+        """A real TLS handshake (real self-signed cert, real
+        negotiated cipher) against the mock PBX's TLS listener, with
+        verification disabled — the common case for an internal
+        engagement target."""
+        server = start_mock_pbx(server_header="TestPBX/1.0")
+        try:
+            req = build_options_request("127.0.0.1", server.tls_port, "127.0.0.1", 0, transport="tls")
+            resp = send_sip_request(
+                req, "127.0.0.1", server.tls_port, timeout=3.0, transport="tls", tls_verify=False,
+            )
+            assert resp.status_code == 200
+            assert resp.header("server") == "TestPBX/1.0"
+            assert resp.tls_info is not None
+            assert resp.tls_info["protocol_version"].startswith("TLSv1")
+            assert resp.tls_info["certificate_present"] is True
+            assert resp.tls_info["certificate_verified"] is False
+            # Confirmed as a real, previously-reproduced bug: the
+            # dict-form getpeercert() is only populated when
+            # verification succeeds, which would make not_after always
+            # None for every scan performed with tls_verify=False (the
+            # exact setting transport_security itself defaults to) —
+            # fixed by parsing the raw DER cert directly instead.
+            assert resp.tls_info["not_after"] is not None
+        finally:
+            server.stop()
+
+    def test_send_sip_request_tls_verify_true_rejects_self_signed_cert(self):
+        """Confirms tls_verify=True (the send_sip_request default)
+        genuinely refuses a self-signed certificate — not a
+        theoretical claim, a real certificate verification failure
+        against the mock PBX's real self-signed cert."""
+        server = start_mock_pbx()
+        try:
+            req = build_options_request("127.0.0.1", server.tls_port, "127.0.0.1", 0, transport="tls")
+            with pytest.raises(SipTimeout, match="[Cc]ertificate"):
+                send_sip_request(
+                    req, "127.0.0.1", server.tls_port, timeout=3.0, transport="tls", tls_verify=True,
+                )
+        finally:
+            server.stop()
+
 
 class TestDualTransportPlugins:
     """Confirms both plugins work correctly over TCP too, not just the
@@ -242,6 +284,184 @@ class TestDualTransportPlugins:
             assert result.findings[0].severity.value == "CRITICAL"
         finally:
             server.stop()
+
+    def test_pbx_fingerprint_over_tls_insecure(self, tmp_path):
+        from voipaudit.plugins.pbx_fingerprint import PBXFingerprintModule
+
+        server = start_mock_pbx(server_header="OpenSIPS 3.4")
+        try:
+            eng = self._engagement(tmp_path)
+            result = PBXFingerprintModule(eng, timeout=3.0, transport="tls", tls_verify=False).run(
+                f"127.0.0.1:{server.tls_port}"
+            )
+            assert result.error is None
+            assert "OpenSIPS" in result.findings[0].title
+        finally:
+            server.stop()
+
+    def test_register_exposed_over_tls_detects_vulnerable_pbx(self, tmp_path):
+        from voipaudit.plugins.register_exposed import RegisterExposedModule
+
+        server = start_mock_pbx(accept_unauthenticated_register=True)
+        try:
+            eng = self._engagement(tmp_path)
+            result = RegisterExposedModule(eng, timeout=3.0, transport="tls", tls_verify=False).run(
+                f"127.0.0.1:{server.tls_port}"
+            )
+            assert result.error is None
+            assert result.findings[0].severity.value == "CRITICAL"
+        finally:
+            server.stop()
+
+
+class TestTransportSecurityPlugin:
+    """Tested against the real mock PBX's real TLS listener, and
+    against a deliberately-crafted genuinely-expired certificate (not
+    a mocked expiry date) for the CRITICAL detection path."""
+
+    def _engagement(self, tmp_path) -> Engagement:
+        path = tmp_path / "authorization.yml"
+        _write_auth_yaml(path, scope={
+            "targets": ["127.0.0.1"], "excluded_targets": [], "allowed_categories": ["recon"],
+        })
+        return Engagement.load(path, tmp_path / "test.audit.jsonl")
+
+    def test_reports_tls_offered_and_valid_certificate(self, tmp_path):
+        from voipaudit.plugins.transport_security import TransportSecurityModule
+
+        server = start_mock_pbx()
+        try:
+            eng = self._engagement(tmp_path)
+            plugin = TransportSecurityModule(
+                eng, timeout=3.0, tls_port=server.tls_port, plaintext_port=server.port,
+            )
+            result = plugin.run(f"127.0.0.1:{server.tls_port}")
+            assert result.error is None
+            titles = [f.title for f in result.findings]
+            assert any("TLS offered" in t for t in titles)
+            assert any("certificate validity OK" in t for t in titles)
+        finally:
+            server.stop()
+
+    def test_reports_tls_not_offered(self, tmp_path):
+        import socket
+
+        from voipaudit.plugins.transport_security import TransportSecurityModule
+
+        closed = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        closed.bind(("127.0.0.1", 0))
+        port = closed.getsockname()[1]
+        closed.close()
+
+        eng = self._engagement(tmp_path)
+        plugin = TransportSecurityModule(eng, timeout=1.0, tls_port=port, plaintext_port=port)
+        result = plugin.run(f"127.0.0.1:{port}")
+        assert result.error is None
+        assert len(result.findings) == 1
+        assert "not offered" in result.findings[0].title
+
+    def test_reports_plaintext_still_accepted_alongside_tls(self, tmp_path):
+        """The mock PBX (like most real deployments that offer TLS)
+        also still accepts plaintext by default — confirms this is
+        flagged, not silently ignored."""
+        from voipaudit.plugins.transport_security import TransportSecurityModule
+
+        server = start_mock_pbx()
+        try:
+            eng = self._engagement(tmp_path)
+            plugin = TransportSecurityModule(
+                eng, timeout=3.0, tls_port=server.tls_port, plaintext_port=server.port,
+            )
+            result = plugin.run(f"127.0.0.1:{server.tls_port}")
+            assert result.error is None
+            plaintext_findings = [f for f in result.findings if "Plaintext SIP still accepted" in f.title]
+            assert len(plaintext_findings) == 1
+            assert plaintext_findings[0].severity.value == "MEDIUM"
+        finally:
+            server.stop()
+
+    def test_detects_expired_certificate(self, tmp_path):
+        """A real, deliberately-crafted certificate with
+        not_valid_after in the past (2020) — not a mocked/patched
+        expiry check, a genuine expired cert produced by the
+        cryptography library and served over a real TLS handshake."""
+        import datetime
+        import socket
+        import ssl
+        import threading
+
+        from cryptography import x509
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.hazmat.primitives.asymmetric import rsa
+        from cryptography.x509.oid import NameOID
+
+        from voipaudit.plugins.transport_security import TransportSecurityModule
+
+        key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "expired.test")])
+        cert = (
+            x509.CertificateBuilder()
+            .subject_name(name).issuer_name(name)
+            .public_key(key.public_key())
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(datetime.datetime(2020, 1, 1, tzinfo=datetime.UTC))
+            .not_valid_after(datetime.datetime(2020, 2, 1, tzinfo=datetime.UTC))
+            .sign(key, hashes.SHA256())
+        )
+        cert_pem = cert.public_bytes(serialization.Encoding.PEM)
+        key_pem = key.private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.TraditionalOpenSSL,
+            encryption_algorithm=serialization.NoEncryption(),
+        )
+        cert_path = tmp_path / "expired_cert.pem"
+        key_path = tmp_path / "expired_key.pem"
+        cert_path.write_bytes(cert_pem)
+        key_path.write_bytes(key_pem)
+
+        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(5)
+        port = listener.getsockname()[1]
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.load_cert_chain(str(cert_path), str(key_path))
+
+        closed = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        closed.bind(("127.0.0.1", 0))
+        closed_port = closed.getsockname()[1]
+        closed.close()
+
+        def serve():
+            while True:
+                try:
+                    conn, _ = listener.accept()
+                except OSError:
+                    break
+                try:
+                    tls_conn = ctx.wrap_socket(conn, server_side=True)
+                    tls_conn.recv(4096)
+                    tls_conn.sendall(b"SIP/2.0 200 OK\r\nServer: ExpiredCertPBX\r\nContent-Length: 0\r\n\r\n")
+                    tls_conn.close()
+                except Exception:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+
+        thread = threading.Thread(target=serve, daemon=True)
+        thread.start()
+
+        try:
+            eng = self._engagement(tmp_path)
+            plugin = TransportSecurityModule(eng, timeout=3.0, tls_port=port, plaintext_port=closed_port)
+            result = plugin.run(f"127.0.0.1:{port}")
+            assert result.error is None
+            critical = [f for f in result.findings if f.severity.value == "CRITICAL"]
+            assert len(critical) == 1
+            assert "expired" in critical[0].title.lower()
+        finally:
+            listener.close()
+            thread.join(timeout=2.0)
 
 
 class TestAuthorization:
