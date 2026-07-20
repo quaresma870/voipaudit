@@ -42,10 +42,14 @@ class PBXFingerprintModule(BasePlugin):
     name = "pbx_fingerprint"
     category = "recon"
 
-    def __init__(self, engagement, timeout: float = 3.0, transport: str = "udp", send_fn=None):
+    def __init__(
+        self, engagement, timeout: float = 3.0, transport: str = "udp",
+        tls_verify: bool = True, send_fn=None,
+    ):
         super().__init__(engagement)
         self.timeout = timeout
         self.transport = transport
+        self.tls_verify = tls_verify
         # send_fn is injectable purely for fast, deterministic unit
         # tests that don't want a real UDP/TCP round trip for every
         # single test case — every test that verifies the plugin's
@@ -61,7 +65,10 @@ class PBXFingerprintModule(BasePlugin):
 
         request = build_options_request(host, port, "0.0.0.0", 0, transport=self.transport)
         try:
-            response = self._send(request, host, port, timeout=self.timeout, transport=self.transport)
+            response = self._send(
+                request, host, port, timeout=self.timeout, transport=self.transport,
+                tls_verify=self.tls_verify,
+            )
         except SipTimeout:
             return [Finding(
                 module=self.name,

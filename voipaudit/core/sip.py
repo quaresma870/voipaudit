@@ -1,6 +1,6 @@
 """
-Raw SIP (RFC 3261) protocol primitives — message construction, UDP and
-TCP transport, response parsing.
+Raw SIP (RFC 3261) protocol primitives — message construction, UDP, TCP,
+and TLS transport, response parsing.
 
 Deliberately built on raw sockets and hand-constructed SIP messages
 rather than a heavy SIP stack (e.g. pjsua2, which needs PJSIP compiled
@@ -12,19 +12,17 @@ start line, colon-separated headers, a blank line, an optional body),
 so this is a small, auditable amount of code, not a real
 protocol-stack undertaking.
 
-Both UDP and TCP are supported, since both are common in real-world
-SIP deployments — UDP for most trunk/PBX signalling, TCP for messages
-too large for a single UDP datagram and as the underlying transport
-for SIP over TLS (not yet implemented here — see the roadmap). The two
-transports need genuinely different handling, not just a different
-socket type: the Via header's transport token must match what's
-actually used (RFC 3261 §18.2.2 — a mismatch is a real, detectable
-protocol violation some SBC/PBX implementations reject or mishandle),
-and TCP is a byte stream with no built-in message boundaries, so a
-response has to be framed correctly by reading headers until the
-blank line, then reading exactly Content-Length more bytes for any
-body — unlike UDP, where one recvfrom() call reliably returns exactly
-one complete datagram.
+Three transports are supported, since all three are common in
+real-world SIP deployments — UDP for most trunk/PBX signalling, TCP
+for messages too large for a single UDP datagram, and TLS (SIPS) for
+encrypted signalling. TLS is layered directly on top of the TCP
+transport's own connection + stream-framing logic (an SSL-wrapped
+socket exposes the same connect()/sendall()/recv() surface as a plain
+one), so it needed no separate message-framing implementation of its
+own — only the socket wrapping and certificate-verification handling
+are new. The Via header's transport token must match what's actually
+used (RFC 3261 §18.2.2 — a mismatch is a real, detectable protocol
+violation some SBC/PBX implementations reject or mishandle).
 """
 
 from __future__ import annotations
@@ -32,10 +30,11 @@ from __future__ import annotations
 import re
 import secrets
 import socket
+import ssl
 import time
 from dataclasses import dataclass, field
 
-_VALID_TRANSPORTS = ("udp", "tcp")
+_VALID_TRANSPORTS = ("udp", "tcp", "tls")
 
 
 class SipTimeout(Exception):
@@ -60,6 +59,11 @@ class SipMessage:
     reason_phrase: str
     headers: dict[str, str] = field(default_factory=dict)
     raw: str = ""
+    tls_info: dict | None = None
+    """Populated only when the response was received over TLS —
+    certificate subject/issuer/expiry and the negotiated protocol
+    version/cipher, the basis of the transport_security plugin's
+    checks. None for UDP/TCP responses."""
 
     def header(self, name: str, default: str | None = None) -> str | None:
         """Case-insensitive header lookup — SIP header names are
@@ -177,7 +181,7 @@ _STATUS_LINE_RE = re.compile(r"^SIP/2\.0\s+(\d{3})\s*(.*)$")
 _CONTENT_LENGTH_RE = re.compile(rb"^content-length\s*:\s*(\d+)\s*$", re.IGNORECASE | re.MULTILINE)
 
 
-def parse_sip_response(raw: bytes) -> SipMessage:
+def parse_sip_response(raw: bytes, tls_info: dict | None = None) -> SipMessage:
     """Parses a SIP response's status line and headers. Deliberately
     does not attempt to interpret the body itself — no probe in this
     module needs one, and SIP bodies (typically SDP) have their own
@@ -206,7 +210,10 @@ def parse_sip_response(raw: bytes) -> SipMessage:
         name, _, value = line.partition(":")
         headers[name.strip().lower()] = value.strip()
 
-    return SipMessage(status_code=status_code, reason_phrase=reason_phrase, headers=headers, raw=text)
+    return SipMessage(
+        status_code=status_code, reason_phrase=reason_phrase, headers=headers, raw=text,
+        tls_info=tls_info,
+    )
 
 
 def send_sip_request(
@@ -216,18 +223,33 @@ def send_sip_request(
     timeout: float = 3.0,
     local_port: int = 0,
     transport: str = "udp",
+    tls_verify: bool = True,
 ) -> SipMessage:
     """Sends a single SIP message and waits for one response, over
-    either UDP or TCP. Raises SipTimeout if nothing usable comes back
+    UDP, TCP, or TLS. Raises SipTimeout if nothing usable comes back
     within `timeout` seconds — the expected, common outcome for a
     closed, filtered, or non-SIP port, deliberately a distinct
     exception from a real protocol/parse error so callers can tell
     "target didn't answer" apart from "target answered with something
-    we couldn't parse"."""
+    we couldn't parse".
+
+    tls_verify=False skips certificate validation — needed to reach a
+    target with a self-signed or otherwise unverifiable certificate at
+    all, an extremely common situation for exactly the kind of
+    authorized internal engagements this tool exists for (matching the
+    same --insecure precedent already established in the sibling
+    redteam-toolkit repo). This never silently downgrades security: it
+    only affects whether THIS client verifies the target's own
+    certificate, not whether the target itself has weak TLS
+    configured — that's exactly what transport_security's own findings
+    check for, using the very information tls_verify=False makes it
+    possible to reach in the first place."""
     transport = _check_transport(transport)
     if transport == "udp":
         return _send_udp(message, target_host, target_port, timeout, local_port)
-    return _send_tcp(message, target_host, target_port, timeout, local_port)
+    if transport == "tcp":
+        return _send_tcp(message, target_host, target_port, timeout, local_port)
+    return _send_tls(message, target_host, target_port, timeout, local_port, tls_verify)
 
 
 def _send_udp(message: bytes, target_host: str, target_port: int, timeout: float, local_port: int) -> SipMessage:
@@ -281,6 +303,113 @@ def _send_tcp(message: bytes, target_host: str, target_port: int, timeout: float
                 f"{target_host}:{target_port} (TCP) closed the connection with no SIP response"
             )
         return parse_sip_response(data)
+    finally:
+        sock.close()
+
+
+def _build_tls_context(verify: bool) -> ssl.SSLContext:
+    if verify:
+        return ssl.create_default_context()
+    # Deliberately mirrors the exact --insecure precedent already
+    # established in the sibling redteam-toolkit repo's
+    # Engagement.ssl_context() — needed to reach a target with a
+    # self-signed or otherwise unverifiable certificate at all, an
+    # extremely common situation for exactly the kind of authorized
+    # internal engagements this tool exists for. This does not affect
+    # what cipher/protocol the TLS handshake itself negotiates, only
+    # whether this client validates the target's certificate chain.
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    return ctx
+
+
+def _extract_tls_info(ssl_sock: ssl.SSLSocket, verify: bool) -> dict:
+    """Pulls certificate and negotiated-connection details off an
+    already-handshaked TLS socket — the basis of transport_security's
+    checks (expired/self-signed certificate, weak protocol version).
+    getpeercert() only returns a decoded certificate dict when
+    verify_mode required one to be presented and validated
+    (CERT_REQUIRED, the default) — with verification disabled
+    (tls_verify=False) it returns an empty dict instead, even though a
+    certificate genuinely was presented. This is by design in Python's
+    ssl module (documented: "If the certificate was not validated, the
+    dict is empty") — there is no verify_mode that gets both "don't
+    refuse an unverifiable target" and "still populate the parsed
+    dict." Confirmed this was a real, not theoretical, problem: it
+    means transport_security's own certificate-expiry check would
+    silently never fire for any target scanned with this plugin's own
+    default tls_verify=False, exactly the setting the plugin needs to
+    even reach a self-signed target at all — found by actually running
+    the plugin against the real mock PBX and noticing the expected
+    certificate-expiry finding never appeared, not by reasoning about
+    the ssl module's behavior in the abstract.
+
+    Fixed by parsing the certificate's raw DER bytes directly via the
+    `cryptography` library instead, using getpeercert(binary_form=True)
+    (which — unlike the dict form — IS populated regardless of
+    verify_mode) as the input. This works identically whether or not
+    verification succeeded."""
+    cert_der = ssl_sock.getpeercert(binary_form=True)
+    info = {
+        "protocol_version": ssl_sock.version(),
+        "cipher": ssl_sock.cipher(),
+        "certificate_verified": verify,
+        "certificate_present": cert_der is not None,
+    }
+    if cert_der:
+        from cryptography import x509
+
+        cert = x509.load_der_x509_certificate(cert_der)
+        info["subject"] = cert.subject.rfc4514_string()
+        info["issuer"] = cert.issuer.rfc4514_string()
+        info["not_before"] = cert.not_valid_before_utc.isoformat()
+        info["not_after"] = cert.not_valid_after_utc.isoformat()
+    return info
+
+
+def _send_tls(
+    message: bytes, target_host: str, target_port: int, timeout: float,
+    local_port: int, tls_verify: bool,
+) -> SipMessage:
+    """TLS is layered directly on top of a TCP connection — an
+    SSL-wrapped socket exposes the same connect()/sendall()/recv()
+    surface as a plain TCP one, so _read_sip_message's stream-framing
+    logic is reused unchanged, not reimplemented."""
+    raw_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    if local_port:
+        raw_sock.bind(("0.0.0.0", local_port))
+    raw_sock.settimeout(timeout)
+
+    ctx = _build_tls_context(tls_verify)
+    sock = ctx.wrap_socket(raw_sock, server_hostname=target_host)
+    try:
+        try:
+            sock.connect((target_host, target_port))
+        except ssl.SSLCertVerificationError as exc:
+            raise SipTimeout(
+                f"TLS certificate verification failed for {target_host}:{target_port}: {exc}. "
+                f"Pass tls_verify=False (--insecure) if this is a known, authorized self-signed target."
+            ) from None
+        except (TimeoutError, ConnectionRefusedError, OSError) as exc:
+            raise SipTimeout(
+                f"Could not establish a TLS connection to {target_host}:{target_port}: {exc}"
+            ) from None
+
+        tls_info = _extract_tls_info(sock, tls_verify)
+
+        sock.sendall(message)
+        try:
+            data = _read_sip_message(sock, timeout)
+        except TimeoutError:
+            raise SipTimeout(
+                f"No SIP response from {target_host}:{target_port} (TLS) within {timeout}s"
+            ) from None
+        if not data:
+            raise SipTimeout(
+                f"{target_host}:{target_port} (TLS) closed the connection with no SIP response"
+            )
+        return parse_sip_response(data, tls_info=tls_info)
     finally:
         sock.close()
 

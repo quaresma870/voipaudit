@@ -33,10 +33,14 @@ class RegisterExposedModule(BasePlugin):
     name = "register_exposed"
     category = "active"
 
-    def __init__(self, engagement, timeout: float = 3.0, transport: str = "udp", send_fn=None):
+    def __init__(
+        self, engagement, timeout: float = 3.0, transport: str = "udp",
+        tls_verify: bool = True, send_fn=None,
+    ):
         super().__init__(engagement)
         self.timeout = timeout
         self.transport = transport
+        self.tls_verify = tls_verify
         self._send = send_fn or send_sip_request
 
     def scan(self, target: str, **kwargs: Any) -> list[Finding]:
@@ -45,7 +49,10 @@ class RegisterExposedModule(BasePlugin):
 
         request = build_register_request(host, port, "0.0.0.0", 0, expires=0, transport=self.transport)
         try:
-            response = self._send(request, host, port, timeout=self.timeout, transport=self.transport)
+            response = self._send(
+                request, host, port, timeout=self.timeout, transport=self.transport,
+                tls_verify=self.tls_verify,
+            )
         except SipTimeout:
             return [Finding(
                 module=self.name,

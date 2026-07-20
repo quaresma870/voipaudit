@@ -7,7 +7,7 @@ name = "voipaudit"
 version = "0.1.0"
 description = "Authorized SIP/VoIP security auditing — PBX fingerprinting, REGISTER exposure checks, and more"
 requires-python = ">=3.11"
-dependencies = ["click>=8.1.0", "rich>=13.7.0", "pyyaml>=6.0.1"]
+dependencies = ["click>=8.1.0", "rich>=13.7.0", "pyyaml>=6.0.1", "cryptography>=42.0.0"]
 
 [project.optional-dependencies]
 dashboard = ["fastapi>=0.110.0", "uvicorn>=0.29.0"]

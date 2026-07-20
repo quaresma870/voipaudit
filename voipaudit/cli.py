@@ -117,20 +117,31 @@ def list_plugins():
 @click.option("--confirm", default=None,
               help="Type the exact engagement_id to enable active-tier plugins this run.")
 @click.option("--timeout", default=3.0, show_default=True, type=float, help="Per-probe SIP timeout in seconds.")
-@click.option("--transport", type=click.Choice(["udp", "tcp"]), default="udp", show_default=True,
-              help="SIP transport to use for every probe this run.")
-def scan(targets, authorization, audit_log, modules, confirm, timeout, transport):
+@click.option("--transport", type=click.Choice(["udp", "tcp", "tls"]), default="udp", show_default=True,
+              help="SIP transport to use for every probe this run (ignored by transport_security, "
+                   "which always checks TLS and plaintext together regardless of this setting).")
+@click.option("--insecure", is_flag=True,
+              help="Skip TLS certificate verification — needed to reach a self-signed or otherwise "
+                   "unverifiable target at all. Never silently downgrades the target's own security; "
+                   "only affects whether this client verifies the target's certificate.")
+@click.option("--tls-port", default=5061, show_default=True, type=int,
+              help="Port to probe for TLS/SIPS — used only by transport_security.")
+@click.option("--plaintext-port", default=5060, show_default=True, type=int,
+              help="Port to probe for plaintext UDP/TCP — used only by transport_security.")
+def scan(targets, authorization, audit_log, modules, confirm, timeout, transport, insecure, tls_port, plaintext_port):
     """Scan one or more SIP targets (host, host:port, or sip:/sips: URI)."""
     from voipaudit.core.authorization import AuthorizationError, load_authorization
     from voipaudit.core.engagement import ActiveTierNotConfirmed, Engagement, ScopeViolation
     from voipaudit.plugins import available_plugins
     from voipaudit.plugins.pbx_fingerprint import PBXFingerprintModule
     from voipaudit.plugins.register_exposed import RegisterExposedModule
+    from voipaudit.plugins.transport_security import TransportSecurityModule
     from voipaudit.reports.terminal import print_results
 
     _PLUGIN_CLASSES = {
         "pbx_fingerprint": PBXFingerprintModule,
         "register_exposed": RegisterExposedModule,
+        "transport_security": TransportSecurityModule,
     }
 
     try:
@@ -172,7 +183,17 @@ def scan(targets, authorization, audit_log, modules, confirm, timeout, transport
         results = []
         for mod_name in selected:
             plugin_cls = _PLUGIN_CLASSES[mod_name]
-            plugin = plugin_cls(eng, timeout=timeout, transport=transport)
+            # transport_security has a genuinely different shape (it
+            # always probes TLS + plaintext together, regardless of
+            # --transport) rather than forcing a one-size-fits-all
+            # constructor across plugins whose actual behavior differs.
+            if mod_name == "transport_security":
+                plugin = plugin_cls(
+                    eng, timeout=timeout, tls_verify=not insecure,
+                    tls_port=tls_port, plaintext_port=plaintext_port,
+                )
+            else:
+                plugin = plugin_cls(eng, timeout=timeout, transport=transport, tls_verify=not insecure)
             try:
                 result = plugin.run(target)
             except ScopeViolation as exc:

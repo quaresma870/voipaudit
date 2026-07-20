@@ -9,4 +9,5 @@ def available_plugins() -> dict[str, str]:
     return {
         "pbx_fingerprint": "recon",
         "register_exposed": "active",
+        "transport_security": "recon",
     }

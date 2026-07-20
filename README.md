@@ -23,7 +23,7 @@ exposure, service disruption, legal liability).
 
 ## Status
 
-Early, actively developed. v0.1 covers two plugins, both over UDP and TCP:
+Early, actively developed. v0.1 covers three plugins, over UDP, TCP, and TLS:
 
 - **`pbx_fingerprint`** (recon tier) — sends a SIP OPTIONS ping (RFC 3261
   §11, no dialog created, no side effects) and identifies the PBX/SIP
@@ -31,15 +31,18 @@ Early, actively developed. v0.1 covers two plugins, both over UDP and TCP:
 - **`register_exposed`** (active tier, requires `--confirm`) — sends a
   real REGISTER with no Authorization header and `Expires: 0`, checking
   whether the target incorrectly accepts an unauthenticated registration.
+- **`transport_security`** (recon tier) — checks whether TLS (SIPS) is
+  offered, reports certificate expiry, and flags plaintext SIP still
+  being accepted alongside TLS (meaning encryption isn't actually
+  *enforced*, just available).
 
-Both transports (`--transport udp` / `--transport tcp`, UDP by default)
+All three transports (`--transport udp` / `tcp` / `tls`, UDP by default;
+`--insecure` to skip certificate verification for a self-signed target)
 are tested against a real mock SIP server over real sockets — not
-simulated or assumed. TLS transport (SIPS) is not yet implemented — see
-the roadmap.
+simulated or assumed, including a real, deliberately-expired certificate
+for `transport_security`'s CRITICAL detection path.
 
-Roadmap ahead: TLS transport, toll-fraud pattern detection, SRTP
-enforcement checks, PBX-specific fingerprint signatures, a persistence +
-dashboard layer, and (longer term) INVITE-spoofing tests.
+See [ROADMAP.md](ROADMAP.md) for what's planned next.
 
 ---
 
@@ -81,9 +84,15 @@ to the standard SIP UDP port 5060 (RFC 3261 §18.1) when omitted. Add
 |--------|------|-----------------|
 | `pbx_fingerprint` | recon | Identifies the PBX/SIP stack via a SIP OPTIONS ping |
 | `register_exposed` | active | Detects unauthenticated REGISTER acceptance |
+| `transport_security` | recon | TLS availability, certificate expiry, plaintext-alongside-TLS |
 
 ```bash
 voipaudit list-plugins
+
+# transport_security probes two independent ports (TLS and plaintext),
+# defaulting to the standard 5061/5060 — override for non-default setups:
+voipaudit scan pbx.example.com --modules transport_security \
+  --tls-port 5061 --plaintext-port 5060 --insecure
 ```
 
 ## The audit log
@@ -114,7 +123,8 @@ voipaudit/
 │   ├── plugins/
 │   │   ├── base.py               # BasePlugin — every plugin's scan() must call authorize_action()
 │   │   ├── pbx_fingerprint.py
-│   │   └── register_exposed.py
+│   │   ├── register_exposed.py
+│   │   └── transport_security.py
 │   └── reports/
 │       └── terminal.py           # Rich-based terminal output
 ├── tests/
