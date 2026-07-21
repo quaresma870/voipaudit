@@ -58,11 +58,12 @@ class TollFraudExposureModule(BasePlugin):
     category = "invite"
 
     def __init__(
-        self, engagement, timeout: float = 4.0,
+        self, engagement, timeout: float = 4.0, transport: str = "udp",
         max_destinations: int = _MAX_DESTINATIONS_PER_RUN,
     ):
         super().__init__(engagement)
         self.timeout = timeout
+        self.transport = transport
         self.max_destinations = min(max_destinations, _MAX_DESTINATIONS_PER_RUN)
 
     def scan(self, target: str, **kwargs: Any) -> list[Finding]:
@@ -79,7 +80,7 @@ class TollFraudExposureModule(BasePlugin):
             test_number = prefix + _TEST_NUMBER_SUFFIX
             try:
                 result = safe_invite_probe(
-                    host, port, to_user=test_number, total_timeout=self.timeout,
+                    host, port, to_user=test_number, total_timeout=self.timeout, transport=self.transport,
                 )
             except InviteProbeError as exc:
                 findings.append(Finding(
