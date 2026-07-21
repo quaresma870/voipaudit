@@ -241,5 +241,76 @@ jobs:
           "
           echo "::endgroup::"
 
+          echo "::group::scan — invite-tier (toll_fraud_exposure), real INVITE against a real mock responder"
+          # The most safety-critical feature in this whole toolkit: a
+          # real INVITE, immediate CANCEL on the first routing-
+          # indicating response. Verifies the full 3-layer
+          # authorization escalation (written acknowledgment in
+          # authorization.yml -> confirm_active_tier -> confirm_invite_tier)
+          # via the real CLI, not just the unit tests already covering
+          # Engagement in isolation.
+          /tmp/smoke-venv/bin/python3 -c "
+          import sys, time
+          sys.path.insert(0, '$GITHUB_WORKSPACE')
+          from tests.fixtures.mock_pbx.invite_responder import start_mock_invite_responder
+          from voipaudit.analyzers.toll_fraud import HIGH_RISK_PREFIXES
+          first_prefix = next(iter(HIGH_RISK_PREFIXES))
+          server = start_mock_invite_responder(destination_behaviors={first_prefix + '5550100': 'ring_then_silence'})
+          with open('/tmp/invite_mock_port.txt', 'w') as f:
+              f.write(str(server.port))
+          time.sleep(30)
+          " > /tmp/invite_mock.log 2>&1 &
+          INVITE_MOCK_PID=$!
+          for i in $(seq 1 20); do
+            if [ -f /tmp/invite_mock_port.txt ]; then break; fi
+            sleep 0.5
+          done
+          INVITE_PORT=$(cat /tmp/invite_mock_port.txt)
+          echo "Mock INVITE responder on port $INVITE_PORT"
+
+          /tmp/smoke-venv/bin/python3 -c "
+          import datetime, yaml
+          from voipaudit.core.authorization import REQUIRED_INVITE_ACKNOWLEDGMENT
+          now = datetime.datetime.now(datetime.timezone.utc)
+          data = {
+              'engagement_id': 'ci-invite-test', 'authorized_by': 'CI', 'authorized_contact_email': 'ci@example.com',
+              'client': 'CI Integration Test',
+              'scope': {'targets': ['127.0.0.1'], 'excluded_targets': [], 'allowed_categories': ['recon', 'active', 'invite']},
+              'window': {
+                  'start': (now - datetime.timedelta(hours=1)).isoformat(),
+                  'end': (now + datetime.timedelta(days=1)).isoformat(),
+              },
+              'confirmation_phrase': 'I confirm authorization for ci-invite-test',
+              'invite_tier_acknowledgment': REQUIRED_INVITE_ACKNOWLEDGMENT,
+          }
+          with open('invite_authorization.yml', 'w') as f:
+              yaml.safe_dump(data, f)
+          "
+
+          # Refused without --confirm at all
+          set +e
+          $VA scan "127.0.0.1:$INVITE_PORT" --modules toll_fraud_exposure -a invite_authorization.yml
+          INVITE_NOCONFIRM_EXIT=$?
+          set -e
+          if [ "$INVITE_NOCONFIRM_EXIT" -eq 0 ]; then
+            echo "::error::toll_fraud_exposure should have been refused without --confirm"
+            exit 1
+          fi
+          echo "Correctly refused without --confirm"
+
+          # Succeeds with --confirm, real CRITICAL finding for the routed destination
+          $VA scan "127.0.0.1:$INVITE_PORT" --modules toll_fraud_exposure --confirm ci-invite-test \
+            -a invite_authorization.yml --json /tmp/invite_findings.json || true
+          cat /tmp/invite_findings.json
+          python3 -c "
+          import json
+          findings = json.load(open('/tmp/invite_findings.json'))
+          assert any(f['severity'] == 'CRITICAL' and 'route' in f['title'].lower() for f in findings), f'expected a CRITICAL routing finding not found: {findings}'
+          print(f'OK: {len(findings)} finding(s), including the expected CRITICAL routing finding')
+          "
+
+          kill $INVITE_MOCK_PID 2>/dev/null || true
+          echo "::endgroup::"
+
           kill $MOCK_PID 2>/dev/null || true
           echo "All integration checks passed."

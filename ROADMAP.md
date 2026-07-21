@@ -62,20 +62,34 @@ shift based on what turns out to matter most in practice.
   (which specifically represents a response to a request this tool
   itself sent during live scanning, not arbitrary bidirectional traffic).
 
+### v0.4.0
+- `toll_fraud_exposure` — the live toll-fraud **exposure** check (as
+  opposed to analyze-cdr/analyze-pcap, which detect fraud that may have
+  already happened): checks whether the PBX's *current configuration*
+  would even route a call toward a known high-risk destination,
+  independent of whether it already has. Origin: proposed by the user
+  as a natural companion to analyze-pcap while choosing priorities — a
+  live-scan complement to the file-analysis-only CDR/pcap checks.
+- A new, dedicated **invite tier**, deliberately sitting above
+  active-tier rather than folded into it: `invite` in
+  `authorization.yml`'s `allowed_categories` requires a new
+  `invite_tier_acknowledgment` field containing an exact, non-
+  paraphrasable acknowledgment text, `active` must ALSO be confirmed
+  first every session (invite is an escalation, not an independent
+  switch), and `--confirm` is still required. See
+  `core/authorization.py`'s `REQUIRED_INVITE_ACKNOWLEDGMENT` and
+  `core/engagement.py`'s `confirm_invite_tier`.
+- `core/invite_probe.py` — real SIP INVITE probing with an immediate
+  CANCEL (or ACK+BYE, for the rare instant-answer case) reflex as soon
+  as any routing-indicating response arrives (180 Ringing, 183 Session
+  Progress, or a 2xx), so the probe only ever needs to observe "is this
+  destination routed at all," never "does the call complete." Verified
+  against 5 real response scenarios (outright rejection, ringing-then-
+  silence, immediate answer, trying-then-silence, total silence) against
+  a real, dedicated mock INVITE responder over real UDP sockets before
+  building the plugin on top of it.
+
 ## Next
-
-The live toll-fraud **exposure** check (as opposed to the CDR/pcap
-analysis above, which detects fraud that may have already happened) is
-what's left of the original "toll fraud detection" idea:
-
-- **Live exposure check** (a `toll_fraud_exposure`-style recon module) —
-  checks whether the PBX's *current configuration* would even allow toll
-  fraud to happen, independent of whether it already has. Likely needs
-  real INVITE-based call-setup testing to check dialplan permissiveness
-  toward expensive destinations, which is a materially higher-risk,
-  active-tier probe than anything shipped so far (a real INVITE can
-  actually ring a phone or incur cost) — needs careful, conservative
-  design before this ships, not a quick add.
 
 ### TCP pcap support
 `analyze-pcap` only extracts UDP payloads in this first version — the
@@ -90,11 +104,13 @@ implementation, not a quick follow-on to the UDP path.
 `transport_security` covers *signalling* encryption (TLS/SIPS). Media
 (RTP) encryption is a separate concern — checking whether a PBX offers or
 requires SRTP (vs plaintext RTP) needs inspecting the SDP body of a real
-call-setup exchange, which (like the live toll-fraud exposure check
-above) means actually attempting a call, not just an OPTIONS ping. Likely
-built alongside or shortly after the live toll-fraud exposure module,
-since both need the same underlying "safely attempt a real INVITE"
-groundwork.
+call-setup exchange. The "safely attempt a real INVITE" groundwork this
+needs now exists (`core/invite_probe.py`, shipped in v0.4.0 for
+`toll_fraud_exposure`) — this would need extending `build_invite` to
+carry a real SDP offer (v0.4's INVITE deliberately carries none, since
+routing-only checks don't need one) and inspecting the far end's SDP
+answer for its offered crypto suite, but the safe-cancel reflex and
+authorization/confirmation model can be reused as-is.
 
 ### More PBX fingerprint signatures
 `pbx_fingerprint`'s signature list is a reasonable starting set, not

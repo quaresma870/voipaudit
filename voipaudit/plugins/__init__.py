@@ -10,4 +10,5 @@ def available_plugins() -> dict[str, str]:
         "pbx_fingerprint": "recon",
         "register_exposed": "active",
         "transport_security": "recon",
+        "toll_fraud_exposure": "invite",
     }

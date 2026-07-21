@@ -19,7 +19,11 @@ from __future__ import annotations
 from pathlib import Path
 
 from voipaudit.core.audit_log import AuditLog
-from voipaudit.core.authorization import Authorization, load_authorization
+from voipaudit.core.authorization import (
+    REQUIRED_INVITE_ACKNOWLEDGMENT,
+    Authorization,
+    load_authorization,
+)
 
 
 class ScopeViolation(PermissionError):
@@ -37,6 +41,21 @@ class ActiveTierNotConfirmed(ScopeViolation):
     thresholds on a real PBX/SBC."""
 
 
+class InviteTierNotConfirmed(ScopeViolation):
+    """Raised when an invite-tier module (a real SIP INVITE probe) is
+    invoked without both the written invite_tier_acknowledgment in
+    authorization.yml AND the in-the-moment confirmation. This sits
+    above active-tier, not alongside it: invite-tier is refused even
+    with 'invite' in allowed_categories and a matching acknowledgment
+    if active-tier hasn't ALSO been separately confirmed this session
+    — a real INVITE (even one cancelled within a second or two) can
+    ring a phone or, in the worst case, be answered and start accruing
+    real per-minute cost, materially different from every other probe
+    this toolkit sends, and the confirmation sequence is deliberately
+    structured as an escalation (recon -> active -> invite) rather
+    than three independent switches."""
+
+
 class Engagement:
     def __init__(
         self,
@@ -46,6 +65,7 @@ class Engagement:
         self.authorization = authorization
         self.audit_log = AuditLog(audit_log_path)
         self._active_tier_confirmed = False
+        self._invite_tier_confirmed = False
 
         from voipaudit.core.rate_limit import (
             DEFAULT_MAX_PER_SECOND,
@@ -113,6 +133,64 @@ class Engagement:
             detail={},
         )
 
+    def confirm_invite_tier(self, typed_engagement_id: str) -> None:
+        """Required once per session, IN ADDITION TO confirm_active_tier
+        (called separately, and must come first — invite-tier is an
+        escalation beyond active-tier, not an independent switch),
+        before any invite-tier module can send a real SIP INVITE.
+        Re-checks the written invite_tier_acknowledgment on every call
+        (not just once at authorization.yml load time) since this is
+        the last real gate before a phone could actually ring."""
+        if "invite" not in self.authorization.scope.allowed_categories:
+            self.audit_log.record(
+                engagement_id=self.authorization.engagement_id, module="engagement", target="-",
+                action="invite_tier_confirmation", allowed=False,
+                detail={"reason": "'invite' is not in this authorization's allowed_categories"},
+            )
+            raise InviteTierNotConfirmed(
+                "Refused: 'invite' is not in this authorization's allowed_categories."
+            )
+
+        if self.authorization.invite_tier_acknowledgment != REQUIRED_INVITE_ACKNOWLEDGMENT:
+            self.audit_log.record(
+                engagement_id=self.authorization.engagement_id, module="engagement", target="-",
+                action="invite_tier_confirmation", allowed=False,
+                detail={"reason": "invite_tier_acknowledgment missing or does not match the required text"},
+            )
+            raise InviteTierNotConfirmed(
+                "Refused: authorization.yml's invite_tier_acknowledgment is missing or doesn't "
+                "exactly match the required text (see core/authorization.py's "
+                "REQUIRED_INVITE_ACKNOWLEDGMENT)."
+            )
+
+        if not self._active_tier_confirmed:
+            self.audit_log.record(
+                engagement_id=self.authorization.engagement_id, module="engagement", target="-",
+                action="invite_tier_confirmation", allowed=False,
+                detail={"reason": "active-tier not confirmed first"},
+            )
+            raise InviteTierNotConfirmed(
+                "Refused: invite-tier requires active-tier to be confirmed first this session "
+                "— call confirm_active_tier() before confirm_invite_tier()."
+            )
+
+        if typed_engagement_id != self.authorization.engagement_id:
+            self.audit_log.record(
+                engagement_id=self.authorization.engagement_id, module="engagement", target="-",
+                action="invite_tier_confirmation", allowed=False,
+                detail={"reason": "typed engagement ID did not match"},
+            )
+            raise InviteTierNotConfirmed(
+                "Refused: typed engagement ID does not match this authorization. "
+                "Invite-tier modules remain unconfirmed."
+            )
+
+        self._invite_tier_confirmed = True
+        self.audit_log.record(
+            engagement_id=self.authorization.engagement_id, module="engagement", target="-",
+            action="invite_tier_confirmation", allowed=True, detail={},
+        )
+
     def authorize_action(
         self, module: str, target: str, action: str, category: str | None = None
     ) -> None:
@@ -137,6 +215,9 @@ class Engagement:
         elif category == "active" and not self._active_tier_confirmed:
             allowed = False
             reason = "active-tier not confirmed for this session — call confirm_active_tier() first"
+        elif category == "invite" and not self._invite_tier_confirmed:
+            allowed = False
+            reason = "invite-tier not confirmed for this session — call confirm_invite_tier() first"
 
         detail = {"category": category} if allowed else {"category": category, "reason": reason}
         self.audit_log.record(

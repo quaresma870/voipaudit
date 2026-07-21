@@ -20,7 +20,8 @@ class Severity(StrEnum):
 
 class FindingCategory(StrEnum):
     RECON = "recon"      # fingerprinting, OPTIONS ping, passive/low-risk protocol probing
-    ACTIVE = "active"     # REGISTER/INVITE spoofing tests, flood-adjacent probing — requires --confirm
+    ACTIVE = "active"     # REGISTER exposure testing, flood-adjacent probing — requires --confirm
+    INVITE = "invite"     # real SIP INVITE probing — requires the invite-tier confirmation escalation
 
 
 @dataclass
