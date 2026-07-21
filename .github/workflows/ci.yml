@@ -420,5 +420,75 @@ jobs:
           kill $TCP_INVITE_MOCK_PID 2>/dev/null || true
           echo "::endgroup::"
 
+          echo "::group::scan — invite-tier over --transport tls --insecure, real INVITE against the mock responder's TLS listener"
+          /tmp/smoke-venv/bin/python3 -c "
+          import sys, time
+          sys.path.insert(0, '$GITHUB_WORKSPACE')
+          from tests.fixtures.mock_pbx.invite_responder import start_mock_invite_responder
+          from voipaudit.analyzers.toll_fraud import HIGH_RISK_PREFIXES
+          first_prefix = next(iter(HIGH_RISK_PREFIXES))
+          server = start_mock_invite_responder(destination_behaviors={first_prefix + '5550100': 'ring_then_silence'})
+          with open('/tmp/tls_invite_mock_port.txt', 'w') as f:
+              f.write(str(server.tls_port))
+          time.sleep(30)
+          " > /tmp/tls_invite_mock.log 2>&1 &
+          TLS_INVITE_MOCK_PID=$!
+          for i in $(seq 1 20); do
+            if [ -f /tmp/tls_invite_mock_port.txt ]; then break; fi
+            sleep 0.5
+          done
+          TLS_INVITE_PORT=$(cat /tmp/tls_invite_mock_port.txt)
+          echo "Mock INVITE responder TLS port: $TLS_INVITE_PORT"
+
+          $VA scan "127.0.0.1:$TLS_INVITE_PORT" --modules toll_fraud_exposure --transport tls --insecure \
+            --confirm ci-invite-test -a invite_authorization.yml --json /tmp/tls_invite_findings.json || true
+          cat /tmp/tls_invite_findings.json
+          python3 -c "
+          import json
+          findings = json.load(open('/tmp/tls_invite_findings.json'))
+          assert any(f['severity'] == 'CRITICAL' and 'route' in f['title'].lower() for f in findings), f'expected a CRITICAL routing finding over TLS not found: {findings}'
+          print(f'OK: {len(findings)} finding(s), including the expected CRITICAL routing finding over TLS')
+          "
+
+          kill $TLS_INVITE_MOCK_PID 2>/dev/null || true
+          echo "::endgroup::"
+
+          echo "::group::analyze-pcap — TLS 1.2 decryption via --tls-keylog, real decrypted SIP call reconstruction"
+          # Reuses tests/fixtures/mock_pbx/tls_pcap.py's real TLS 1.2
+          # client/server session capture (same helper the unit tests
+          # in tests/test_pcap_tls.py exercise) -- a real handshake,
+          # real AEAD-encrypted SIP traffic, and a real SSLKEYLOGFILE,
+          # not a hand-approximated ciphertext.
+          /tmp/smoke-venv/bin/python3 -c "
+          import sys
+          sys.path.insert(0, '$GITHUB_WORKSPACE')
+          from pathlib import Path
+          from tests.fixtures.mock_pbx.tls_pcap import capture_tls12_pcap
+          call_id = 'ci-tls-call@test'
+          invite = (
+              f'INVITE sip:252633333333@192.168.1.20 SIP/2.0\r\nFrom: <sip:2005@192.168.1.10>;tag=a1\r\n'
+              f'To: <sip:252633333333@192.168.1.20>\r\nCall-ID: {call_id}\r\nCSeq: 1 INVITE\r\nContent-Length: 0\r\n\r\n'
+          ).encode()
+          ok = (
+              f'SIP/2.0 200 OK\r\nFrom: <sip:2005@192.168.1.10>;tag=a1\r\n'
+              f'To: <sip:252633333333@192.168.1.20>;tag=b1\r\nCall-ID: {call_id}\r\nCSeq: 1 INVITE\r\nContent-Length: 0\r\n\r\n'
+          ).encode()
+          pcap_path, keylog_path = capture_tls12_pcap(Path('/tmp/ci_tls_pcap'), [(invite, ok)])
+          print(f'pcap={pcap_path} keylog={keylog_path}')
+          with open('/tmp/ci_tls_pcap_paths.txt', 'w') as f:
+              f.write(f'{pcap_path}\n{keylog_path}\n')
+          "
+          PCAP_PATH=$(sed -n '1p' /tmp/ci_tls_pcap_paths.txt)
+          KEYLOG_PATH=$(sed -n '2p' /tmp/ci_tls_pcap_paths.txt)
+          $VA analyze-pcap "$PCAP_PATH" --tls-keylog "$KEYLOG_PATH" --json /tmp/tls_pcap_findings.json || true
+          cat /tmp/tls_pcap_findings.json
+          python3 -c "
+          import json
+          findings = json.load(open('/tmp/tls_pcap_findings.json'))
+          assert any(f['severity'] == 'CRITICAL' and '+252' in f['title'] for f in findings), f'expected +252 finding from the TLS-decrypted call not found: {findings}'
+          print(f'OK: {len(findings)} finding(s), the TLS-decrypted call was correctly reconstructed and analyzed')
+          "
+          echo "::endgroup::"
+
           kill $MOCK_PID 2>/dev/null || true
           echo "All integration checks passed."

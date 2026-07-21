@@ -335,6 +335,139 @@ class TestSafeInviteProbeOverTCP:
             server.stop()
 
 
+class TestSafeInviteProbeOverTLS:
+    """The exact same 5 response scenarios already proven over UDP and
+    TCP, repeated over TLS against the mock responder's TLS listener
+    (the same real, checked-in test certificate used by
+    tests/fixtures/mock_pbx/server.py's own TLS tests) — confirms
+    _TLSTransport's inherited _TCPTransport send/receive_one logic
+    genuinely works unchanged once layered under TLS, not just in
+    theory."""
+
+    def test_outright_rejection_not_flagged_as_routed_no_cancel_sent(self):
+        server = start_mock_invite_responder(destination_behaviors={"reject1": "reject"})
+        try:
+            result = safe_invite_probe(
+                "127.0.0.1", server.tls_port, "reject1", total_timeout=3.0,
+                transport="tls", tls_verify=False,
+            )
+            assert result.appears_routed is False
+            assert result.rejected_outright is True
+            assert result.final_status_code == 404
+            assert result.cancelled is False
+        finally:
+            server.stop()
+
+    def test_ringing_then_silence_detected_as_routed_and_cancelled_immediately(self):
+        server = start_mock_invite_responder(destination_behaviors={"ring1": "ring_then_silence"})
+        try:
+            start = time.monotonic()
+            result = safe_invite_probe(
+                "127.0.0.1", server.tls_port, "ring1", total_timeout=4.0,
+                transport="tls", tls_verify=False,
+            )
+            elapsed = time.monotonic() - start
+
+            assert result.appears_routed is True
+            assert result.cancelled is True
+            assert elapsed < 1.0
+            # Confirms the CANCEL genuinely arrives over the SAME TLS
+            # connection the INVITE was sent on, matching
+            # _TLSTransport's connect-once-reuse-throughout design
+            # (inherited from _TCPTransport).
+            assert server.wait_for_methods(["INVITE", "CANCEL"], timeout=2.0)
+        finally:
+            server.stop()
+
+    def test_immediate_answer_triggers_ack_then_bye(self):
+        server = start_mock_invite_responder(destination_behaviors={"answer1": "answer"})
+        try:
+            result = safe_invite_probe(
+                "127.0.0.1", server.tls_port, "answer1", total_timeout=3.0,
+                transport="tls", tls_verify=False,
+            )
+            assert result.appears_routed is True
+            assert result.final_status_code == 200
+            assert result.acked_and_byed is True
+            assert server.wait_for_methods(["INVITE", "ACK", "BYE"], timeout=2.0)
+        finally:
+            server.stop()
+
+    def test_trying_then_silence_waits_grace_period_then_cancels(self):
+        server = start_mock_invite_responder(destination_behaviors={"trying1": "trying_then_silence"})
+        try:
+            start = time.monotonic()
+            result = safe_invite_probe(
+                "127.0.0.1", server.tls_port, "trying1", total_timeout=4.0,
+                grace_after_first_response=1.0, transport="tls", tls_verify=False,
+            )
+            elapsed = time.monotonic() - start
+            assert result.appears_routed is False
+            assert result.cancelled is True
+            assert 0.9 < elapsed < 2.5
+        finally:
+            server.stop()
+
+    def test_total_silence_times_out_cleanly(self):
+        """A silent, non-TLS-speaking listener: the TLS handshake
+        itself never completes, so this exercises the connect-time
+        failure path (surfaced as InviteProbeError) rather than a
+        post-handshake response timeout — TLS's own distinct failure
+        mode, same as TCP's connection-refused case below."""
+        import socket
+
+        silent = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        silent.bind(("127.0.0.1", 0))
+        silent.listen(1)
+        port = silent.getsockname()[1]
+        try:
+            with pytest.raises(InviteProbeError):
+                safe_invite_probe(
+                    "127.0.0.1", port, "silent1", total_timeout=1.5,
+                    transport="tls", tls_verify=False, connect_timeout=1.5,
+                )
+        finally:
+            silent.close()
+
+    def test_connection_refused_raises_invite_probe_error(self):
+        import socket
+
+        closed = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        closed.bind(("127.0.0.1", 0))
+        port = closed.getsockname()[1]
+        closed.close()  # closed immediately -- guarantees nothing is listening
+
+        with pytest.raises(InviteProbeError):
+            safe_invite_probe(
+                "127.0.0.1", port, "x", total_timeout=2.0, transport="tls", tls_verify=False,
+            )
+
+    def test_certificate_verification_failure_raises_helpful_invite_probe_error(self):
+        """tls_verify=True (the default) against the mock's real but
+        self-signed test certificate must fail closed with a clear,
+        actionable error -- not silently proceed, and not raise some
+        other unrelated/unhandled exception."""
+        server = start_mock_invite_responder(destination_behaviors={"reject1": "reject"})
+        try:
+            with pytest.raises(InviteProbeError, match="certificate verification failed"):
+                safe_invite_probe(
+                    "127.0.0.1", server.tls_port, "reject1", total_timeout=3.0, transport="tls",
+                )
+        finally:
+            server.stop()
+
+    def test_via_header_says_tls_not_udp_or_tcp(self):
+        server = start_mock_invite_responder(destination_behaviors={"viacheck1": "reject"})
+        try:
+            safe_invite_probe(
+                "127.0.0.1", server.tls_port, "viacheck1", total_timeout=3.0,
+                transport="tls", tls_verify=False,
+            )
+            assert "INVITE" in server.received_methods
+        finally:
+            server.stop()
+
+
 class TestTollFraudExposurePlugin:
     def _engagement(self, tmp_path) -> Engagement:
         path = tmp_path / "authorization.yml"
@@ -356,6 +489,31 @@ class TestTollFraudExposurePlugin:
             eng = self._engagement(tmp_path)
             plugin = TollFraudExposureModule(eng, timeout=3.0, max_destinations=1)
             result = plugin.run(f"127.0.0.1:{server.port}")
+            assert result.error is None
+            assert len(result.findings) == 1
+            assert result.findings[0].severity.value == "CRITICAL"
+            assert first_prefix in result.findings[0].title
+        finally:
+            server.stop()
+
+    def test_permissive_dialplan_flagged_critical_over_tls(self, tmp_path):
+        """Same scenario as above, but via transport='tls' + tls_verify=False
+        end to end through the plugin -- confirms the plugin genuinely
+        wires tls_verify through to safe_invite_probe, not just that
+        safe_invite_probe itself supports TLS in isolation."""
+        from voipaudit.analyzers.toll_fraud import HIGH_RISK_PREFIXES
+        from voipaudit.plugins.toll_fraud_exposure import TollFraudExposureModule
+
+        first_prefix = next(iter(HIGH_RISK_PREFIXES))
+        server = start_mock_invite_responder(destination_behaviors={
+            first_prefix + "5550100": "ring_then_silence",
+        })
+        try:
+            eng = self._engagement(tmp_path)
+            plugin = TollFraudExposureModule(
+                eng, timeout=3.0, max_destinations=1, transport="tls", tls_verify=False,
+            )
+            result = plugin.run(f"127.0.0.1:{server.tls_port}")
             assert result.error is None
             assert len(result.findings) == 1
             assert result.findings[0].severity.value == "CRITICAL"

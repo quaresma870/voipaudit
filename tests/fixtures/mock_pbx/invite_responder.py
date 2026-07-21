@@ -17,24 +17,29 @@ run: outright rejection, ringing-then-silence (the key "dialplan
 routes this" signal), an immediate answer, trying-then-silence, and
 total silence.
 
-Both UDP and TCP listeners are provided, sharing all response/behavior
-logic through a generalized `sender` callable (bytes -> None) — so the
-same behavior table works identically regardless of which transport a
-test exercises. For TCP, the same connection used for the INVITE stays
-open and is read from again for the CANCEL/ACK/BYE follow-up, matching
-core/invite_probe.py's own _TCPTransport design of reusing one
-connection throughout a probe.
+UDP, TCP, and TLS listeners are all provided, sharing all response/
+behavior logic through a generalized `sender` callable (bytes -> None)
+— so the same behavior table works identically regardless of which
+transport a test exercises. For TCP/TLS, the same connection used for
+the INVITE stays open and is read from again for the CANCEL/ACK/BYE
+follow-up, matching core/invite_probe.py's own _TCPTransport/
+_TLSTransport design of reusing one connection throughout a probe. TLS
+uses the same real, checked-in test certificate
+(tests/fixtures/mock_pbx/certs) as tests/fixtures/mock_pbx/server.py.
 """
 
 from __future__ import annotations
 
 import re
 import socket
+import ssl
 import threading
 import time
 from collections.abc import Callable
+from pathlib import Path
 
 _HEADER_RE = re.compile(r"^([A-Za-z-]+):\s*(.*)$")
+_CERTS_DIR = Path(__file__).parent / "certs"
 
 
 class _TCPMessageReader:
@@ -120,17 +125,31 @@ class MockInviteResponder:
         self.tcp_port = self._tcp_sock.getsockname()[1]
         self._tcp_thread: threading.Thread | None = None
 
+        self._tls_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._tls_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._tls_sock.bind((host, 0))
+        self._tls_sock.listen(8)
+        self.tls_port = self._tls_sock.getsockname()[1]
+        self._tls_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        self._tls_context.load_cert_chain(
+            certfile=str(_CERTS_DIR / "cert.pem"), keyfile=str(_CERTS_DIR / "key.pem")
+        )
+        self._tls_thread: threading.Thread | None = None
+
     def start(self) -> None:
         self._running = True
         self._udp_thread = threading.Thread(target=self._serve_udp_forever, daemon=True)
         self._udp_thread.start()
         self._tcp_thread = threading.Thread(target=self._serve_tcp_forever, daemon=True)
         self._tcp_thread.start()
+        self._tls_thread = threading.Thread(target=self._serve_tls_forever, daemon=True)
+        self._tls_thread.start()
 
     def stop(self) -> None:
         self._running = False
         self._udp_sock.close()
         self._tcp_sock.close()
+        self._tls_sock.close()
 
     def _serve_udp_forever(self) -> None:
         while self._running:
@@ -155,6 +174,22 @@ class MockInviteResponder:
                 break
             threading.Thread(target=self._handle_tcp_connection, args=(conn,), daemon=True).start()
 
+    def _serve_tls_forever(self) -> None:
+        while self._running:
+            try:
+                conn, _addr = self._tls_sock.accept()
+            except OSError:
+                break  # listening socket closed
+            try:
+                tls_conn = self._tls_context.wrap_socket(conn, server_side=True)
+            except ssl.SSLError:
+                conn.close()  # e.g. a plain (non-TLS) probe hit this port -- not a crash-worthy event
+                continue
+            # Once handshaked, an SSLSocket exposes the same
+            # settimeout/recv/sendall surface a plain TCP socket does,
+            # so the exact same connection handler is reused unchanged.
+            threading.Thread(target=self._handle_tcp_connection, args=(tls_conn,), daemon=True).start()
+
     def _handle_tcp_connection(self, conn: socket.socket) -> None:
         sender: Callable[[bytes], None] = conn.sendall
         reader = _TCPMessageReader(conn)
@@ -164,13 +199,45 @@ class MockInviteResponder:
                 data = reader.read_one()
                 if not data:
                     break  # peer closed the connection, or nothing more arrives
-                self._handle(data, sender)
+                # async_dispatch=False here (unlike the UDP path below) --
+                # see _handle's own docstring-comment for why this
+                # specific difference is real and load-bearing, not
+                # arbitrary, for the stream-based (TCP/TLS) transports.
+                self._handle(data, sender, async_dispatch=False)
         except Exception:
-            pass
+            pass  # a real PBX doesn't crash a listener thread on a malformed probe; neither should this
         finally:
             conn.close()
 
-    def _handle(self, data: bytes, sender: Callable[[bytes], None]) -> None:
+    def _handle(self, data: bytes, sender: Callable[[bytes], None], async_dispatch: bool = True) -> None:
+        """async_dispatch controls whether the computed response is sent
+        from a NEW thread (True, the UDP path's behavior) or synchronously
+        on the CURRENT thread (False, required for TCP/TLS).
+
+        Confirmed a real, reproducible race condition here (not
+        theoretical) once a TLS listener was added: over TCP, one thread
+        reading a connection while a second thread (this method's own
+        previously-unconditional threading.Thread dispatch) calls
+        conn.sendall() on the SAME socket happens to be safe, because a
+        plain kernel socket supports full-duplex access from two threads
+        with no shared mutable state between the read and write paths.
+        An SSLSocket is NOT safe this way -- OpenSSL's SSL object holds
+        shared per-connection record-layer state that a concurrent
+        SSL_read() (this connection's reading loop, in
+        _handle_tcp_connection) and SSL_write() (a `_run_behavior` call
+        dispatched to its own thread) can corrupt, intermittently
+        (~30-40% of runs, reproduced directly with client- and
+        server-side instrumentation showing the reading thread's next
+        recv() spuriously returning b"" -- read as "peer closed" -- often
+        followed by a BrokenPipeError on the client's next write). Since
+        UDP's shared receive loop serves every client through the same
+        socket (a slow per-request response genuinely could stall
+        unrelated clients) it keeps the original async dispatch, which is
+        safe for a plain UDP socket regardless. TCP/TLS each already get
+        their own dedicated per-connection thread from
+        _serve_tcp_forever/_serve_tls_forever, and no behavior here ever
+        sleeps, so dispatching synchronously costs nothing and removes
+        the concurrent-access hazard entirely."""
         text = data.decode("utf-8", errors="replace")
         lines = text.split("\r\n") if "\r\n" in text else text.split("\n")
         first_line = lines[0]
@@ -195,7 +262,10 @@ class MockInviteResponder:
                 behavior = b
                 break
 
-        threading.Thread(target=self._run_behavior, args=(behavior, headers, sender, body), daemon=True).start()
+        if async_dispatch:
+            threading.Thread(target=self._run_behavior, args=(behavior, headers, sender, body), daemon=True).start()
+        else:
+            self._run_behavior(behavior, headers, sender, body)
 
     def _run_behavior(
         self, behavior: str, headers: dict[str, str], sender: Callable[[bytes], None], offer_body: str = "",

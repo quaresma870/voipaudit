@@ -120,6 +120,29 @@ class TestSRTPCheckPlugin:
         finally:
             server.stop()
 
+    def test_srtp_supported_reports_info_over_tls(self, tmp_path):
+        """Same scenario as test_srtp_supported_reports_info, but via
+        transport='tls' + tls_verify=False end to end through the
+        plugin -- confirms tls_verify is genuinely wired through to
+        both of the plugin's safe_invite_probe calls (SRTP offer AND
+        plain-RTP baseline), not just one of them."""
+        from voipaudit.plugins.srtp_check import SRTPCheckModule
+
+        server = start_mock_invite_responder(destination_behaviors={
+            "voipaudit-srtp-test": "answer_with_srtp",
+        })
+        try:
+            eng = self._engagement(tmp_path)
+            result = SRTPCheckModule(eng, timeout=3.0, transport="tls", tls_verify=False).run(
+                f"127.0.0.1:{server.tls_port}"
+            )
+            assert result.error is None
+            assert len(result.findings) == 1
+            assert result.findings[0].severity.value == "INFO"
+            assert "supported" in result.findings[0].title.lower()
+        finally:
+            server.stop()
+
     def test_differential_detects_srtp_not_supported(self, tmp_path):
         """The core scenario this plugin's whole design exists for:
         a PBX that answers plain RTP normally but specifically rejects

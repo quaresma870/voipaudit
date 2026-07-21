@@ -47,11 +47,13 @@ class SRTPCheckModule(BasePlugin):
 
     def __init__(
         self, engagement, timeout: float = 4.0, to_user: str = _DEFAULT_TEST_USER, transport: str = "udp",
+        tls_verify: bool = True,
     ):
         super().__init__(engagement)
         self.timeout = timeout
         self.to_user = to_user
         self.transport = transport
+        self.tls_verify = tls_verify
 
     def scan(self, target: str, **kwargs: Any) -> list[Finding]:
         host, port = _split_host_port(target)
@@ -61,7 +63,7 @@ class SRTPCheckModule(BasePlugin):
         try:
             srtp_result = safe_invite_probe(
                 host, port, to_user=self.to_user, total_timeout=self.timeout, sdp_offer=srtp_offer,
-                transport=self.transport,
+                transport=self.transport, tls_verify=self.tls_verify,
             )
         except InviteProbeError as exc:
             return [Finding(
@@ -75,7 +77,7 @@ class SRTPCheckModule(BasePlugin):
         try:
             plain_result = safe_invite_probe(
                 host, port, to_user=self.to_user, total_timeout=self.timeout, sdp_offer=plain_offer,
-                transport=self.transport,
+                transport=self.transport, tls_verify=self.tls_verify,
             )
         except InviteProbeError as exc:
             return [Finding(

@@ -232,28 +232,19 @@ def scan(targets, authorization, audit_log, modules, confirm, timeout, transport
             # transport_security has a genuinely different shape from
             # the rest (it always probes TLS + plaintext together
             # regardless of --transport). toll_fraud_exposure and
-            # srtp_check both use core/invite_probe.py, which supports
-            # 'udp' and 'tcp' but not yet 'tls' (a real, tracked gap —
-            # see ROADMAP.md) — selecting --transport tls for either is
-            # refused explicitly below rather than left to fail
-            # per-destination at INVITE-send time.
+            # srtp_check both use core/invite_probe.py, which now
+            # supports 'tls' too (core/invite_probe.py's _TLSTransport),
+            # so --transport tls is passed straight through like udp/tcp.
             if mod_name == "transport_security":
                 plugin = plugin_cls(
                     eng, timeout=timeout, tls_verify=not insecure,
                     tls_port=tls_port, plaintext_port=plaintext_port,
                 )
             elif mod_name in ("toll_fraud_exposure", "srtp_check"):
-                if transport == "tls":
-                    console.print(
-                        f"[red]✘ {mod_name} doesn't support --transport tls yet "
-                        f"(core/invite_probe.py is udp/tcp only for now).[/red]"
-                    )
-                    exit_code = 1
-                    continue
                 if mod_name == "toll_fraud_exposure":
-                    plugin = plugin_cls(eng, timeout=timeout, transport=transport)
+                    plugin = plugin_cls(eng, timeout=timeout, transport=transport, tls_verify=not insecure)
                 else:
-                    kwargs = {"timeout": timeout, "transport": transport}
+                    kwargs = {"timeout": timeout, "transport": transport, "tls_verify": not insecure}
                     if to_user:
                         kwargs["to_user"] = to_user
                     plugin = plugin_cls(eng, **kwargs)
@@ -335,9 +326,15 @@ def analyze_cdr(cdr_file, business_start_hour, business_end_hour, json_output):
               help="Hour (0-23) business hours start — calls before this are 'off-hours'.")
 @click.option("--business-end-hour", default=21, show_default=True, type=int,
               help="Hour (0-23) business hours end — calls at/after this are 'off-hours'.")
+@click.option("--tls-keylog", default=None, type=click.Path(exists=True),
+              help="SSLKEYLOGFILE (NSS Key Log format, the same file Wireshark's own "
+                   "'Decrypt TLS traffic' uses) to additionally decrypt TLS/SIPS-carried SIP "
+                   "traffic in this capture. TLS 1.2 only — see core/pcap_parser.py for why "
+                   "TLS 1.3 isn't attempted. Without this, TLS-carried SIP traffic in the "
+                   "capture is silently skipped, same as any other undecryptable traffic.")
 @click.option("--json", "json_output", default=None, type=click.Path(),
               help="Also write findings as JSON to this path.")
-def analyze_pcap(pcap_file, business_start_hour, business_end_hour, json_output):
+def analyze_pcap(pcap_file, business_start_hour, business_end_hour, tls_keylog, json_output):
     """Analyze a packet capture (pcap/pcapng) for toll-fraud patterns.
 
     Reconstructs SIP call sessions directly from captured traffic and
@@ -357,7 +354,7 @@ def analyze_pcap(pcap_file, business_start_hour, business_end_hour, json_output)
     from voipaudit.reports.terminal import print_results
 
     try:
-        records = parse_pcap_to_call_records(pcap_file)
+        records = parse_pcap_to_call_records(pcap_file, tls_keylog=tls_keylog)
     except PcapParseError as exc:
         console.print(f"[red]✘ Could not parse {pcap_file}:[/red] {exc}")
         sys.exit(1)
