@@ -26,7 +26,12 @@ from voipaudit.core.engagement import (
     Engagement,
     InviteTierNotConfirmed,
 )
-from voipaudit.core.invite_probe import InviteProbeError, safe_invite_probe
+from voipaudit.core.invite_probe import (
+    REFER_TRANSFER_TEST_EXTENSION,
+    InviteProbeError,
+    safe_invite_probe,
+    safe_transfer_probe,
+)
 
 
 def _write_auth_yaml(path: Path, **overrides) -> None:
@@ -464,6 +469,113 @@ class TestSafeInviteProbeOverTLS:
                 transport="tls", tls_verify=False,
             )
             assert "INVITE" in server.received_methods
+        finally:
+            server.stop()
+
+
+class TestSafeTransferProbe:
+    """Tests for safe_transfer_probe -- the first invite-tier probe
+    that lets a call actually CONNECT (a real 2xx) rather than
+    cancelling at the first routing-indicating response. Tested
+    against the mock invite responder's REFER/NOTIFY-aware behaviors
+    (answer_then_refer_accepted / answer_then_refer_rejected)."""
+
+    def test_never_answered_destination_no_dialog_no_refer_sent(self):
+        server = start_mock_invite_responder(destination_behaviors={"reject1": "reject"})
+        try:
+            result = safe_transfer_probe("127.0.0.1", server.port, "reject1", total_timeout=3.0)
+            assert result.dialog_established is False
+            assert result.refer_sent is False
+            assert result.bye_sent is False
+            assert "REFER" not in server.received_methods
+            assert "BYE" not in server.received_methods
+        finally:
+            server.stop()
+
+    def test_ringing_then_silence_cancelled_no_dialog(self):
+        server = start_mock_invite_responder(destination_behaviors={"ring1": "ring_then_silence"})
+        try:
+            result = safe_transfer_probe("127.0.0.1", server.port, "ring1", total_timeout=3.0)
+            assert result.dialog_established is False
+            assert result.refer_sent is False
+            assert server.wait_for_methods(["INVITE", "CANCEL"], timeout=2.0)
+        finally:
+            server.stop()
+
+    def test_refer_accepted_and_notified_reports_honored(self):
+        server = start_mock_invite_responder(destination_behaviors={"accept1": "answer_then_refer_accepted"})
+        try:
+            result = safe_transfer_probe("127.0.0.1", server.port, "accept1", total_timeout=3.0, refer_wait_timeout=1.5)
+            assert result.dialog_established is True
+            assert result.refer_sent is True
+            assert result.refer_final_status_code == 202
+            assert result.notify_received is True
+            assert result.notify_sipfrag == "SIP/2.0 200 OK"
+            assert result.refer_appears_honored is True
+            assert result.bye_sent is True
+            assert server.wait_for_methods(["INVITE", "ACK", "REFER", "BYE"], timeout=2.0)
+        finally:
+            server.stop()
+
+    def test_refer_rejected_reports_not_honored(self):
+        server = start_mock_invite_responder(destination_behaviors={"reject_refer1": "answer_then_refer_rejected"})
+        try:
+            result = safe_transfer_probe(
+                "127.0.0.1", server.port, "reject_refer1", total_timeout=3.0, refer_wait_timeout=1.0,
+            )
+            assert result.dialog_established is True
+            assert result.refer_final_status_code == 403
+            assert result.notify_received is False
+            assert result.refer_appears_honored is False
+            assert result.bye_sent is True
+        finally:
+            server.stop()
+
+    def test_refer_with_no_response_at_all_reports_not_honored(self):
+        """A target that answers the INVITE but doesn't understand/
+        respond to REFER at all (no behavior-specific handling
+        configured) must be reported as NOT honored, not crash or
+        hang -- the safe, conservative default."""
+        server = start_mock_invite_responder(destination_behaviors={"plain1": "answer"})
+        try:
+            result = safe_transfer_probe("127.0.0.1", server.port, "plain1", total_timeout=3.0, refer_wait_timeout=1.0)
+            assert result.dialog_established is True
+            assert result.refer_sent is True
+            assert result.refer_final_status_code is None
+            assert result.notify_received is False
+            assert result.refer_appears_honored is False
+            assert result.bye_sent is True
+        finally:
+            server.stop()
+
+    def test_refer_to_uses_synthetic_fictional_extension(self):
+        """Confirms the Refer-To destination really is the hardcoded
+        synthetic extension, not something derived from the target
+        being tested -- the whole safety argument in this function's
+        docstring depends on this being true, not just documented."""
+        assert "5550100" in REFER_TRANSFER_TEST_EXTENSION  # NANP fictional/test-reserved suffix
+
+    def test_over_tcp(self):
+        server = start_mock_invite_responder(destination_behaviors={"accept1": "answer_then_refer_accepted"})
+        try:
+            result = safe_transfer_probe(
+                "127.0.0.1", server.tcp_port, "accept1", total_timeout=3.0,
+                refer_wait_timeout=1.5, transport="tcp",
+            )
+            assert result.refer_appears_honored is True
+            assert result.bye_sent is True
+        finally:
+            server.stop()
+
+    def test_over_tls(self):
+        server = start_mock_invite_responder(destination_behaviors={"accept1": "answer_then_refer_accepted"})
+        try:
+            result = safe_transfer_probe(
+                "127.0.0.1", server.tls_port, "accept1", total_timeout=3.0,
+                refer_wait_timeout=1.5, transport="tls", tls_verify=False,
+            )
+            assert result.refer_appears_honored is True
+            assert result.bye_sent is True
         finally:
             server.stop()
 

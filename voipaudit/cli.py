@@ -137,10 +137,18 @@ def list_plugins():
               help="Also write findings as JSON to this path — a more robust way to check "
                    "results programmatically than parsing the terminal table's word-wrapped text.")
 @click.option("--to-user", default=None,
-              help="Destination user/extension to test — used only by srtp_check. Defaults to a "
-                   "generic placeholder; results are strongest against a known-valid, reachable "
-                   "extension.")
-def scan(targets, authorization, audit_log, modules, confirm, timeout, transport, insecure, tls_port, plaintext_port, json_output, to_user):
+              help="Destination user/extension to test — used by srtp_check, caller_id_spoofing, "
+                   "and refer_transfer_abuse. Defaults to a generic placeholder; results are "
+                   "strongest against a known-valid, reachable extension.")
+@click.option("--spoof-from", default=None,
+              help="Identity to claim (From header and P-Asserted-Identity) in caller_id_spoofing's "
+                   "spoofed-identity probe. Defaults to --to-user itself (\"the destination calling "
+                   "itself\") — set this to a specific known-trusted internal identity to test "
+                   "instead (e.g. a reception or executive extension).")
+def scan(
+    targets, authorization, audit_log, modules, confirm, timeout, transport, insecure, tls_port,
+    plaintext_port, json_output, to_user, spoof_from,
+):
     """Scan one or more SIP targets (host, host:port, or sip:/sips: URI)."""
     from voipaudit.core.authorization import AuthorizationError, load_authorization
     from voipaudit.core.engagement import (
@@ -150,7 +158,9 @@ def scan(targets, authorization, audit_log, modules, confirm, timeout, transport
         ScopeViolation,
     )
     from voipaudit.plugins import available_plugins
+    from voipaudit.plugins.caller_id_spoofing import CallerIDSpoofingModule
     from voipaudit.plugins.pbx_fingerprint import PBXFingerprintModule
+    from voipaudit.plugins.refer_transfer_abuse import ReferTransferAbuseModule
     from voipaudit.plugins.register_exposed import RegisterExposedModule
     from voipaudit.plugins.srtp_check import SRTPCheckModule
     from voipaudit.plugins.toll_fraud_exposure import TollFraudExposureModule
@@ -163,6 +173,8 @@ def scan(targets, authorization, audit_log, modules, confirm, timeout, transport
         "transport_security": TransportSecurityModule,
         "toll_fraud_exposure": TollFraudExposureModule,
         "srtp_check": SRTPCheckModule,
+        "caller_id_spoofing": CallerIDSpoofingModule,
+        "refer_transfer_abuse": ReferTransferAbuseModule,
     }
 
     try:
@@ -231,23 +243,24 @@ def scan(targets, authorization, audit_log, modules, confirm, timeout, transport
             plugin_cls = _PLUGIN_CLASSES[mod_name]
             # transport_security has a genuinely different shape from
             # the rest (it always probes TLS + plaintext together
-            # regardless of --transport). toll_fraud_exposure and
-            # srtp_check both use core/invite_probe.py, which now
-            # supports 'tls' too (core/invite_probe.py's _TLSTransport),
-            # so --transport tls is passed straight through like udp/tcp.
+            # regardless of --transport). The other invite-tier
+            # plugins all use core/invite_probe.py, which supports
+            # udp/tcp/tls uniformly, so --transport is passed straight
+            # through to each of them the same way.
             if mod_name == "transport_security":
                 plugin = plugin_cls(
                     eng, timeout=timeout, tls_verify=not insecure,
                     tls_port=tls_port, plaintext_port=plaintext_port,
                 )
-            elif mod_name in ("toll_fraud_exposure", "srtp_check"):
-                if mod_name == "toll_fraud_exposure":
-                    plugin = plugin_cls(eng, timeout=timeout, transport=transport, tls_verify=not insecure)
-                else:
-                    kwargs = {"timeout": timeout, "transport": transport, "tls_verify": not insecure}
-                    if to_user:
-                        kwargs["to_user"] = to_user
-                    plugin = plugin_cls(eng, **kwargs)
+            elif mod_name in (
+                "toll_fraud_exposure", "srtp_check", "caller_id_spoofing", "refer_transfer_abuse",
+            ):
+                kwargs = {"timeout": timeout, "transport": transport, "tls_verify": not insecure}
+                if mod_name != "toll_fraud_exposure" and to_user:
+                    kwargs["to_user"] = to_user
+                if mod_name == "caller_id_spoofing" and spoof_from:
+                    kwargs["spoof_from"] = spoof_from
+                plugin = plugin_cls(eng, **kwargs)
             else:
                 plugin = plugin_cls(eng, timeout=timeout, transport=transport, tls_verify=not insecure)
             try:

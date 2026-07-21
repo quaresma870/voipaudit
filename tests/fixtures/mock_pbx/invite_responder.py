@@ -31,6 +31,7 @@ uses the same real, checked-in test certificate
 from __future__ import annotations
 
 import re
+import secrets
 import socket
 import ssl
 import threading
@@ -39,6 +40,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 _HEADER_RE = re.compile(r"^([A-Za-z-]+):\s*(.*)$")
+_URI_USER_RE = re.compile(r"sip:([^@;>]+)@")
 _CERTS_DIR = Path(__file__).parent / "certs"
 
 
@@ -247,14 +249,19 @@ class MockInviteResponder:
         with self._lock:
             self.received_methods.append(method)
 
-        if method != "INVITE":
-            return  # CANCEL/ACK/BYE follow-ups are just recorded above, no response needed for these tests
+        if method not in ("INVITE", "REFER"):
+            return  # CANCEL/ACK/BYE/NOTIFY-ACK follow-ups are just recorded above, no response needed here
 
         if "\r\n\r\n" in text:
             body = text.split("\r\n\r\n", 1)[1]
         else:
             body = ""
 
+        # REFER re-targets the SAME dialog's To-URI (RFC 3515), so the
+        # same destination_behaviors lookup by request-URI substring
+        # finds the same behavior key already selected for the INVITE
+        # that established this dialog -- no separate dialog state
+        # needs tracking here.
         request_uri = first_line.split(" ")[1] if len(first_line.split(" ")) > 1 else ""
         behavior = "reject"
         for dest_substr, b in self.destination_behaviors.items():
@@ -262,13 +269,23 @@ class MockInviteResponder:
                 behavior = b
                 break
 
+        if method == "REFER":
+            if async_dispatch:
+                threading.Thread(target=self._run_refer_behavior, args=(behavior, headers, sender), daemon=True).start()
+            else:
+                self._run_refer_behavior(behavior, headers, sender)
+            return
+
         if async_dispatch:
-            threading.Thread(target=self._run_behavior, args=(behavior, headers, sender, body), daemon=True).start()
+            threading.Thread(
+                target=self._run_behavior, args=(behavior, headers, sender, body, request_uri), daemon=True,
+            ).start()
         else:
-            self._run_behavior(behavior, headers, sender, body)
+            self._run_behavior(behavior, headers, sender, body, request_uri)
 
     def _run_behavior(
         self, behavior: str, headers: dict[str, str], sender: Callable[[bytes], None], offer_body: str = "",
+        request_uri: str = "",
     ) -> None:
         if behavior == "silent":
             return
@@ -278,8 +295,31 @@ class MockInviteResponder:
             self._send_response(180, "Ringing", headers, sender, to_tag="mockring")
         elif behavior == "trying_then_silence":
             self._send_response(100, "Trying", headers, sender)
-        elif behavior == "answer":
+        elif behavior in ("answer", "answer_then_refer_accepted", "answer_then_refer_rejected"):
+            # The latter two behave identically to a plain "answer" for
+            # the INVITE leg itself -- their REFER-specific handling is
+            # in _run_refer_behavior below, dispatched separately once
+            # a REFER actually arrives within the dialog this answer
+            # establishes.
             self._send_response(200, "OK", headers, sender, to_tag="mockans")
+        elif behavior == "reject_self_spoofed_identity":
+            # Identity-aware, mirroring the offer-aware SRTP pattern:
+            # genuinely inspects the INVITE's claimed identity (From
+            # user-part, or P-Asserted-Identity if present) rather than
+            # responding identically regardless -- rejects outright
+            # when the caller claims to BE the destination it's
+            # calling (the self-spoof pattern caller_id_spoofing's
+            # default --spoof-from produces), routes normally
+            # otherwise. Used to test caller_id_spoofing's
+            # "differentiated handling" (safe/expected) outcome, the
+            # same way srtp_only_pbx tests srtp_check's differential.
+            claimed = self._extract_pai_or_from_user(headers)
+            dest_user = _URI_USER_RE.search(request_uri)
+            dest_user = dest_user.group(1) if dest_user else None
+            if claimed and dest_user and claimed == dest_user:
+                self._send_response(403, "Forbidden", headers, sender)
+            else:
+                self._send_response(180, "Ringing", headers, sender, to_tag="mockring")
         elif behavior == "answer_with_srtp":
             sdp = self._build_answer_sdp("RTP/SAVP", with_crypto=True)
             self._send_response(200, "OK", headers, sender, to_tag="mocksrtp", sdp_body=sdp)
@@ -343,6 +383,73 @@ class MockInviteResponder:
             sender("\r\n".join(lines).encode() + b"\r\n" + body_bytes)
         except OSError:
             pass
+
+    def _run_refer_behavior(
+        self, behavior: str, req_headers: dict[str, str], sender: Callable[[bytes], None],
+    ) -> None:
+        """Deliberately does NOT spawn a new thread for the NOTIFY sent
+        below, even for the "accepted" case -- this method is already
+        invoked on the correct thread for whichever transport is in
+        play (the shared UDP thread, or the TCP/TLS connection's own
+        reading thread via async_dispatch=False), and spawning another
+        one here to send the NOTIFY concurrently with that same
+        thread's own reads would reintroduce the exact concurrent
+        SSL read/write hazard _handle's own docstring already
+        documents and fixes for the INVITE-response path."""
+        if behavior == "answer_then_refer_accepted":
+            self._send_response(202, "Accepted", req_headers, sender)
+            self._send_refer_notify(req_headers, sender)
+        elif behavior == "answer_then_refer_rejected":
+            self._send_response(403, "Forbidden", req_headers, sender)
+        # else: no REFER-specific behavior defined for this destination
+        # -- no response at all, a safe no-op default matching every
+        # other unrecognized-behavior case in this fixture.
+
+    @staticmethod
+    def _send_refer_notify(req_headers: dict[str, str], sender: Callable[[bytes], None]) -> None:
+        """RFC 3515 §2.4.2: a NOTIFY (Event: refer) reporting transfer
+        progress via a message/sipfrag body. From/To are swapped
+        relative to the REFER we're responding to -- we (the notifier)
+        are now the request's sender within this in-dialog exchange,
+        so our own identity (the REFER's "To") becomes this request's
+        "From", and the referrer's identity (the REFER's "From")
+        becomes this request's "To"."""
+        from_header = req_headers.get("to", "")
+        to_header = req_headers.get("from", "")
+        call_id = req_headers.get("call-id", "")
+        branch = "z9hG4bK" + secrets.token_hex(8)
+        sipfrag = "SIP/2.0 200 OK\r\n"
+        body_bytes = sipfrag.encode()
+        lines = [
+            "NOTIFY sip:voipaudit-probe@127.0.0.1 SIP/2.0",
+            f"Via: SIP/2.0/UDP 127.0.0.1;branch={branch}",
+            f"From: {from_header}",
+            f"To: {to_header}",
+            f"Call-ID: {call_id}",
+            "CSeq: 1 NOTIFY",
+            "Event: refer",
+            "Subscription-State: terminated;reason=noresource",
+            "Content-Type: message/sipfrag",
+            f"Content-Length: {len(body_bytes)}",
+            "",
+        ]
+        try:
+            sender("\r\n".join(lines).encode() + b"\r\n" + body_bytes)
+        except OSError:
+            pass
+
+    @staticmethod
+    def _extract_pai_or_from_user(headers: dict[str, str]) -> str | None:
+        """P-Asserted-Identity takes precedence when present (it's the
+        specific header caller_id_spoofing's differential test also
+        supplies), falling back to the plain From header's user part
+        otherwise."""
+        for header_name in ("p-asserted-identity", "from"):
+            value = headers.get(header_name, "")
+            m = _URI_USER_RE.search(value)
+            if m:
+                return m.group(1)
+        return None
 
     @staticmethod
     def _parse_headers(lines: list[str]) -> dict[str, str]:

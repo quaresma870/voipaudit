@@ -114,6 +114,7 @@ def build_invite(
     target_host: str, target_port: int, local_host: str, local_port: int,
     from_user: str, to_user: str, branch: str, from_tag: str, call_id: str,
     user_agent: str = "voipaudit/0.1", sdp_body: str | None = None, transport: str = "udp",
+    p_asserted_identity: str | None = None,
 ) -> bytes:
     """No SDP body by default — most callers (toll_fraud_exposure) only
     need to observe how the dialplan/routing responds to the
@@ -125,6 +126,17 @@ def build_invite(
     offer in the INVITE to observe what the far end negotiates back —
     same immediate-cancel safety reflex applies regardless of whether
     SDP is present.
+
+    p_asserted_identity (RFC 3325) is used specifically by the
+    caller_id_spoofing plugin: normally only ever inserted by a node
+    INSIDE a trusted SIP network (a "Spec(T)" trust domain) to assert a
+    caller's verified identity to other trusted nodes — an untrusted,
+    unauthenticated party (like this tool, sending a bare INVITE with
+    no prior registration) supplying its OWN P-Asserted-Identity is
+    exactly the differential probe: does the target simply trust
+    whatever identity is self-asserted, or does it strip/reject a
+    self-supplied one from an untrusted source the way RFC 3325 assumes
+    it should.
 
     transport sets the Via header's transport token (RFC 3261
     §18.2.2 — must reflect the transport actually used, the same
@@ -143,6 +155,8 @@ def build_invite(
         f"Contact: <sip:{from_user}@{local_host}:{local_port}>",
         f"User-Agent: {user_agent}",
     ]
+    if p_asserted_identity:
+        lines.append(f"P-Asserted-Identity: <sip:{p_asserted_identity}@{local_host}>")
     if sdp_body:
         lines.append("Content-Type: application/sdp")
     lines.append(f"Content-Length: {len(body_bytes)}")
@@ -202,11 +216,18 @@ def build_ack(
 def build_bye(
     target_host: str, target_port: int, local_host: str, local_port: int,
     from_user: str, to_user: str, from_tag: str, to_tag: str, call_id: str,
-    transport: str = "udp",
+    transport: str = "udp", cseq_number: int = 2,
 ) -> bytes:
     """Ends a call that was unexpectedly answered, immediately after
     the mandatory ACK above — a fresh branch (BYE is a new
-    transaction, unlike CANCEL which must reuse the INVITE's)."""
+    transaction, unlike CANCEL which must reuse the INVITE's). cseq_number
+    defaults to 2 (the first in-dialog request after the INVITE's own
+    CSeq 1) but must be bumped by callers that already sent one other
+    in-dialog request first (e.g. safe_transfer_probe's REFER, CSeq 2,
+    making its own final BYE CSeq 3) — CSeq MUST strictly increase
+    within a dialog per RFC 3261 §12.2.1.1, and reusing an already-spent
+    number is a real protocol violation some targets would reject or
+    mishandle, not merely a cosmetic detail."""
     to_uri = f"sip:{to_user}@{target_host}"
     branch = _gen_branch()
     lines = [
@@ -216,7 +237,61 @@ def build_bye(
         f"From: <sip:{from_user}@{local_host}>;tag={from_tag}",
         f"To: <{to_uri}>;tag={to_tag}",
         f"Call-ID: {call_id}",
-        "CSeq: 2 BYE",
+        f"CSeq: {cseq_number} BYE",
+        "Content-Length: 0",
+        "", "",
+    ]
+    return "\r\n".join(lines).encode("utf-8")
+
+
+def build_refer(
+    target_host: str, target_port: int, local_host: str, local_port: int,
+    from_user: str, to_user: str, from_tag: str, to_tag: str, call_id: str,
+    refer_to_user: str, transport: str = "udp", cseq_number: int = 2,
+) -> bytes:
+    """RFC 3515: REFER within the dialog already established by a
+    successfully-answered INVITE — reuses that dialog's Call-ID/
+    From-tag/To-tag (a fresh branch, since REFER is its own
+    transaction) and the next CSeq number in the dialog's sequence
+    (the INVITE itself was CSeq 1). Refer-To names the transfer
+    target — see safe_transfer_probe's own docstring for why this is
+    always a synthetic, fictional extension in practice, never a
+    caller-supplied real destination."""
+    to_uri = f"sip:{to_user}@{target_host}"
+    branch = _gen_branch()
+    refer_to_uri = f"sip:{refer_to_user}@{target_host}"
+    lines = [
+        f"REFER {to_uri} SIP/2.0",
+        f"Via: SIP/2.0/{transport.upper()} {local_host}:{local_port};branch={branch}",
+        "Max-Forwards: 70",
+        f"From: <sip:{from_user}@{local_host}>;tag={from_tag}",
+        f"To: <{to_uri}>;tag={to_tag}",
+        f"Call-ID: {call_id}",
+        f"CSeq: {cseq_number} REFER",
+        f"Refer-To: <{refer_to_uri}>",
+        f"Contact: <sip:{from_user}@{local_host}:{local_port}>",
+        "Content-Length: 0",
+        "", "",
+    ]
+    return "\r\n".join(lines).encode("utf-8")
+
+
+def build_ok_response(msg: SIPMessage) -> bytes:
+    """A bare 200 OK for an in-dialog REQUEST this tool receives (the
+    only one expected during safe_transfer_probe is a NOTIFY reporting
+    REFER progress, RFC 3515 §2.4.2 — responding is mandatory
+    regardless of what it reports). A SIP response's Via/From/To/
+    Call-ID/CSeq are copied verbatim from the request that triggered
+    it (RFC 3261 §8.2.6.2 — unlike a new in-dialog REQUEST, a response
+    never swaps From/To), so no tag bookkeeping of our own is needed
+    here at all."""
+    lines = [
+        "SIP/2.0 200 OK",
+        f"Via: {msg.header('via', '')}",
+        f"From: {msg.header('from', '')}",
+        f"To: {msg.header('to', '')}",
+        f"Call-ID: {msg.header('call-id', '')}",
+        f"CSeq: {msg.header('cseq', '')}",
         "Content-Length: 0",
         "", "",
     ]
@@ -407,6 +482,7 @@ def safe_invite_probe(
     transport: str = "udp",
     connect_timeout: float = 3.0,
     tls_verify: bool = True,
+    p_asserted_identity: str | None = None,
 ) -> InviteProbeResult:
     """Sends one real INVITE and reacts to whatever comes back,
     cancelling (or ACK+BYE-ing) at the earliest possible moment that
@@ -435,7 +511,10 @@ def safe_invite_probe(
     and the last one seen is exposed via result.answer_sdp, regardless
     of whether sdp_offer was given (a target could in principle include
     SDP in an unsolicited early-media response even to an offer-less
-    INVITE, though this is rare)."""
+    INVITE, though this is rare).
+
+    p_asserted_identity is optional and unused by default — passed by
+    the caller_id_spoofing plugin (see build_invite's own docstring)."""
     branch = _gen_branch()
     from_tag = _gen_tag()
     call_id = _gen_call_id(local_host if local_host != "0.0.0.0" else "voipaudit")
@@ -459,6 +538,7 @@ def safe_invite_probe(
         invite = build_invite(
             target_host, target_port, local_host, conn.local_port,
             from_user, to_user, branch, from_tag, call_id, sdp_body=sdp_offer, transport=transport,
+            p_asserted_identity=p_asserted_identity,
         )
         try:
             conn.send(invite)
@@ -564,3 +644,241 @@ def _extract_to_tag(msg: SIPMessage) -> str | None:
     if "tag=" not in to_header:
         return None
     return to_header.split("tag=", 1)[1].split(";")[0].strip()
+
+
+# The REFER-based transfer probe's Refer-To destination is deliberately
+# hardcoded, not caller-configurable, to a synthetic/fictional
+# extension -- see safe_transfer_probe's own docstring for the full
+# safety reasoning (this probe has no way to cancel whatever call the
+# TARGET itself places as a result of an honored REFER, unlike every
+# other check in this module). Mirrors toll_fraud_exposure's own
+# reserved-for-fictional-use test-number convention.
+REFER_TRANSFER_TEST_EXTENSION = "voipaudit-refer-test-5550100"
+
+# How long to wait, after sending the REFER itself, for either a final
+# response to the REFER transaction or an in-dialog NOTIFY reporting
+# transfer progress -- deliberately short and separate from
+# total_timeout (which only bounds the initial INVITE wait), since by
+# this point a real dialog is already open and every additional second
+# is additional exposure for a probe that has already committed to
+# letting a call connect.
+DEFAULT_REFER_WAIT_TIMEOUT = 2.0
+
+
+@dataclass
+class TransferProbeResult:
+    dialog_established: bool = False
+    invite_final_status_code: int | None = None
+    refer_sent: bool = False
+    refer_final_status_code: int | None = None
+    notify_received: bool = False
+    notify_sipfrag: str | None = None
+    bye_sent: bool = False
+
+    @property
+    def refer_appears_honored(self) -> bool:
+        """True if the target's own signalling indicates the REFER was
+        accepted and, per any NOTIFY received, at least attempted --
+        the real, actionable signal this probe exists to produce,
+        independent of whether the resulting transfer itself actually
+        succeeded (this probe has no way to observe that, and
+        Refer-To is a synthetic extension regardless — see this
+        module's own docstring)."""
+        if self.refer_final_status_code is not None and 200 <= self.refer_final_status_code < 300:
+            return True
+        return bool(self.notify_sipfrag)
+
+
+def safe_transfer_probe(
+    target_host: str,
+    target_port: int,
+    to_user: str,
+    from_user: str = "voipaudit-probe",
+    local_host: str = "0.0.0.0",
+    local_port: int = 0,
+    total_timeout: float = DEFAULT_TOTAL_TIMEOUT,
+    grace_after_first_response: float = DEFAULT_GRACE_AFTER_FIRST_RESPONSE,
+    transport: str = "udp",
+    connect_timeout: float = 3.0,
+    tls_verify: bool = True,
+    refer_wait_timeout: float = DEFAULT_REFER_WAIT_TIMEOUT,
+) -> TransferProbeResult:
+    """Tests whether the target honors an in-dialog REFER (RFC 3515
+    call transfer) from an unauthenticated caller — the toll-fraud-via-
+    transfer question, distinct from toll_fraud_exposure's own direct-
+    INVITE-toward-a-high-risk-destination question, since some
+    dialplans restrict direct outbound dialing more tightly than
+    transfer-initiated calls.
+
+    This is the first invite-tier probe in this module that lets a call
+    actually CONNECT (a real 2xx answer) rather than cancelling at the
+    very first routing-indicating response — a materially higher-risk
+    step than every other check here, so read this docstring in full
+    before using it, and before changing anything about its safety
+    reflexes below.
+
+    Why REFER can't reuse safe_invite_probe's immediate-CANCEL reflex:
+    that reflex works because every call this tool ever places is one
+    IT sent (via this same connection/dialog), so cancelling or
+    hanging up is always within this tool's own control. Once a target
+    HONORS a REFER by placing a new call toward the Refer-To
+    destination, that new call is the TARGET's own outbound call, on
+    its own dialog this probe was never a party to — there is no
+    message this probe could send to cancel it. This is exactly why
+    REFER_TRANSFER_TEST_EXTENSION (the Refer-To target) is a hardcoded,
+    synthetic, fictional extension rather than a caller-supplied
+    parameter: even in the worst case (the target blindly honors the
+    transfer), the result is, at most, an internal dial attempt toward
+    a number that almost certainly doesn't exist — never a real,
+    billable, external destination this tool has no way to undo.
+
+    The flow: INVITE -> (only if answered) ACK -> REFER -> a bounded
+    wait for either a final response to the REFER transaction itself or
+    an in-dialog NOTIFY reporting transfer progress (responded to with
+    a bare 200 OK per RFC 3515's own requirement, regardless of what it
+    reports) -> BYE, unconditionally, ending this dialog as promptly as
+    every other probe in this module already does. If the original
+    INVITE is never answered (rejected outright, silent, or only
+    ringing-then-silence), there is no dialog to test REFER against at
+    all — the same CANCEL-on-routing-indicating-response reflex from
+    safe_invite_probe applies identically for that case, and the
+    result simply reports dialog_established=False, refer_sent=False.
+    """
+    branch = _gen_branch()
+    from_tag = _gen_tag()
+    call_id = _gen_call_id(local_host if local_host != "0.0.0.0" else "voipaudit")
+
+    result = TransferProbeResult()
+    to_tag: str | None = None
+    try:
+        conn = _open_transport(
+            transport, target_host, target_port, local_port, connect_timeout, tls_verify=tls_verify,
+        )
+    except ssl.SSLCertVerificationError as exc:
+        raise InviteProbeError(
+            f"TLS certificate verification failed for {target_host}:{target_port}: {exc}. "
+            f"Pass tls_verify=False (--insecure) if this is a known, authorized self-signed target."
+        ) from exc
+    except (OSError, ValueError) as exc:
+        raise InviteProbeError(
+            f"Could not establish a {transport.upper()} connection to {target_host}:{target_port}: {exc}"
+        ) from exc
+
+    try:
+        invite = build_invite(
+            target_host, target_port, local_host, conn.local_port,
+            from_user, to_user, branch, from_tag, call_id, transport=transport,
+        )
+        try:
+            conn.send(invite)
+        except OSError as exc:
+            raise InviteProbeError(f"Could not send INVITE to {target_host}:{target_port}: {exc}") from exc
+
+        deadline = time.monotonic() + total_timeout
+        answered = False
+
+        while time.monotonic() < deadline:
+            remaining = deadline - time.monotonic()
+            data = conn.receive_one(remaining)
+            if data is None:
+                break
+            try:
+                msg = parse_sip_message(data)
+            except Exception:
+                continue
+            if msg.is_request or msg.call_id != call_id:
+                continue
+            status = msg.status_code or 0
+
+            if status in _ROUTING_INDICATING_PROVISIONAL_CODES:
+                # Routed, but not yet answered -- no dialog exists to
+                # test REFER against without a real 2xx, so this is
+                # exactly safe_invite_probe's own CANCEL case.
+                cancel = build_cancel(
+                    target_host, target_port, local_host, conn.local_port,
+                    from_user, to_user, branch, from_tag, call_id, transport=transport,
+                )
+                try:
+                    conn.send(cancel)
+                except OSError:
+                    pass
+                return result
+
+            if 200 <= status < 300:
+                result.invite_final_status_code = status
+                to_tag = _extract_to_tag(msg)
+                answered = bool(to_tag)
+                break
+
+            if status >= 300:
+                result.invite_final_status_code = status
+                return result  # rejected outright -- no dialog, nothing to test
+
+            deadline = min(deadline, time.monotonic() + grace_after_first_response)
+
+        if not answered:
+            return result  # never answered (or answered without an extractable To-tag) -- nothing to test
+
+        result.dialog_established = True
+
+        # RFC 3261: ACK is mandatory for every 2xx response to an
+        # INVITE, regardless of what happens next.
+        ack = build_ack(
+            target_host, target_port, local_host, conn.local_port,
+            from_user, to_user, branch, from_tag, to_tag, call_id, transport=transport,
+        )
+        try:
+            conn.send(ack)
+        except OSError:
+            return result  # can't even ACK -- nothing more to safely attempt
+
+        refer = build_refer(
+            target_host, target_port, local_host, conn.local_port,
+            from_user, to_user, from_tag, to_tag, call_id,
+            refer_to_user=REFER_TRANSFER_TEST_EXTENSION, transport=transport, cseq_number=2,
+        )
+        try:
+            conn.send(refer)
+            result.refer_sent = True
+        except OSError:
+            return result
+
+        refer_deadline = time.monotonic() + refer_wait_timeout
+        while time.monotonic() < refer_deadline:
+            remaining = refer_deadline - time.monotonic()
+            data = conn.receive_one(remaining)
+            if data is None:
+                break
+            try:
+                msg = parse_sip_message(data)
+            except Exception:
+                continue
+            if msg.call_id != call_id:
+                continue
+
+            if msg.is_request and msg.method == "NOTIFY":
+                result.notify_received = True
+                result.notify_sipfrag = msg.body.strip() if msg.body else None
+                try:
+                    conn.send(build_ok_response(msg))
+                except OSError:
+                    pass
+                continue  # keep waiting out the remaining budget for the REFER's own final response too
+
+            if not msg.is_request and result.refer_final_status_code is None:
+                result.refer_final_status_code = msg.status_code
+
+        return result
+    finally:
+        if result.dialog_established and to_tag:
+            bye = build_bye(
+                target_host, target_port, local_host, conn.local_port,
+                from_user, to_user, from_tag, to_tag, call_id, transport=transport,
+                cseq_number=3 if result.refer_sent else 2,
+            )
+            try:
+                conn.send(bye)
+                result.bye_sent = True
+            except OSError:
+                pass
+        conn.close()
