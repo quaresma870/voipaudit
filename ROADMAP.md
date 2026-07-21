@@ -229,6 +229,57 @@ shift based on what turns out to matter most in practice.
   undecryptable/non-SIP traffic), not a crash or wrong output — verified
   directly, not assumed.
 
+### v0.8.0
+- `caller_id_spoofing` (invite tier) — a DIFFERENTIAL test (same design
+  philosophy as srtp_check), not a naive "does it route with a fake
+  From" check: since a SIP dialplan's routing decision is normally
+  keyed on the Request-URI, not the From header, treating "routes the
+  same either way" as a vulnerability would be a false positive
+  against the overwhelming majority of real, correctly-functioning
+  deployments. Instead sends a baseline INVITE and a second one to the
+  SAME destination claiming a spoofed identity (both via From AND
+  P-Asserted-Identity — RFC 3325's trusted-identity mechanism, which
+  an unauthenticated party should never be able to successfully
+  self-assert) — defaulting to "the destination calling itself" (no
+  legitimate explanation, a hallmark of CLI-spoofing/vishing testing),
+  or a specific known-trusted identity via `--spoof-from`. Reports
+  MEDIUM (not an overclaimed CRITICAL/HIGH) when signalling-level
+  treatment doesn't differ at all between the two, and INFO when it
+  does — honest about what this evidence does and doesn't prove.
+- `refer_transfer_abuse` (invite tier) — tests whether the target
+  honors an in-dialog REFER (RFC 3515 call transfer) from an
+  unauthenticated caller, a toll-fraud vector distinct from
+  toll_fraud_exposure's direct-INVITE question (some dialplans
+  restrict outbound dialing more tightly than transfers). The first
+  invite-tier probe that lets a call actually CONNECT (a real 2xx)
+  rather than cancelling at the first routing-indicating response —
+  a materially higher-risk step, addressed by a new, dedicated
+  `core/invite_probe.py` function (`safe_transfer_probe`) whose
+  Refer-To destination is hardcoded to a synthetic, fictional
+  extension (`REFER_TRANSFER_TEST_EXTENSION`), never caller-suppliable:
+  once a target honors a REFER, this tool has no dialog with — and
+  therefore no way to cancel — whatever call the target itself places
+  as a result, unlike every other check in this module where cancelling
+  is always within this tool's own control. Flow: INVITE -> (only if
+  answered) ACK -> REFER -> a bounded wait for either the REFER's own
+  final response or an in-dialog NOTIFY reporting transfer progress
+  (responded to with a bare 200 OK per RFC 3515, regardless of what it
+  reports) -> BYE, unconditionally and promptly, matching this
+  module's own established "never leave a dialog open longer than
+  needed" pattern.
+- Found and fixed a real, reproducible concurrency bug while extending
+  the mock invite responder for REFER testing (not just accepted the
+  design as correct): the NOTIFY-sending helper naturally wanted its
+  own `threading.Thread` dispatch, which would have reintroduced the
+  EXACT concurrent-SSL-read/write hazard already found and fixed for
+  the plain INVITE-response path in v0.7.0 — caught before it shipped
+  by recognizing the same pattern, not by re-discovering the bug from
+  scratch.
+- Both new checks' authorization gating, differential design, and full
+  transport coverage (UDP/TCP/TLS) verified against a real, extended
+  mock invite responder (`reject_self_spoofed_identity`,
+  `answer_then_refer_accepted`/`answer_then_refer_rejected` behaviors).
+
 ## Next
 
 ### TLS 1.3 pcap decryption support
@@ -249,7 +300,13 @@ A `--db` flag to persist scan results (matching the sibling
 secureaudit/redteam-toolkit/loganalyzer repos' own SQLite-backed history
 pattern) and a read-only web dashboard to browse past engagements.
 
-### Longer term: INVITE-spoofing tests
-Testing whether Caller-ID / From-header spoofing is accepted — a real,
-active-tier, higher-risk probe needing the same careful design
-consideration as the live toll-fraud and SRTP checks above.
+### Longer term: REFER-to-real-destination transfer confirmation
+`refer_transfer_abuse` deliberately only ever targets a synthetic,
+fictional extension (see v0.8.0 above for why) — it can prove a
+target's dialplan *accepts* an unauthenticated REFER, but not that a
+transfer toward a real, external, billable destination actually
+completes. Confirming that end-to-end would need a second, receiving
+UA this tool controls (to observe an actual incoming call from the
+transfer), a materially different architecture from every other
+single-sided probe in this module — worth real design thought before
+attempting, not a small extension of the current approach.

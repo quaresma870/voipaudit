@@ -12,4 +12,6 @@ def available_plugins() -> dict[str, str]:
         "transport_security": "recon",
         "toll_fraud_exposure": "invite",
         "srtp_check": "invite",
+        "caller_id_spoofing": "invite",
+        "refer_transfer_abuse": "invite",
     }

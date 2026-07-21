@@ -490,5 +490,67 @@ jobs:
           "
           echo "::endgroup::"
 
+          echo "::group::scan — caller_id_spoofing, real differential test against the identity-aware mock responder"
+          /tmp/smoke-venv/bin/python3 -c "
+          import sys, time
+          sys.path.insert(0, '$GITHUB_WORKSPACE')
+          from tests.fixtures.mock_pbx.invite_responder import start_mock_invite_responder
+          server = start_mock_invite_responder(destination_behaviors={'voipaudit-spoof-test': 'reject_self_spoofed_identity'})
+          with open('/tmp/spoof_mock_port.txt', 'w') as f:
+              f.write(str(server.port))
+          time.sleep(30)
+          " > /tmp/spoof_mock.log 2>&1 &
+          SPOOF_MOCK_PID=$!
+          for i in $(seq 1 20); do
+            if [ -f /tmp/spoof_mock_port.txt ]; then break; fi
+            sleep 0.5
+          done
+          SPOOF_PORT=$(cat /tmp/spoof_mock_port.txt)
+          echo "Mock identity-aware responder on port $SPOOF_PORT"
+
+          $VA scan "127.0.0.1:$SPOOF_PORT" --modules caller_id_spoofing --confirm ci-invite-test \
+            -a invite_authorization.yml --json /tmp/spoof_findings.json || true
+          cat /tmp/spoof_findings.json
+          python3 -c "
+          import json
+          findings = json.load(open('/tmp/spoof_findings.json'))
+          assert any(f['severity'] == 'INFO' and 'differently' in f['title'].lower() for f in findings), f'expected an INFO differentiated-handling finding not found: {findings}'
+          print(f'OK: {len(findings)} finding(s), including the expected differentiated-handling finding')
+          "
+
+          kill $SPOOF_MOCK_PID 2>/dev/null || true
+          echo "::endgroup::"
+
+          echo "::group::scan — refer_transfer_abuse, real REFER/NOTIFY exchange against the mock responder"
+          /tmp/smoke-venv/bin/python3 -c "
+          import sys, time
+          sys.path.insert(0, '$GITHUB_WORKSPACE')
+          from tests.fixtures.mock_pbx.invite_responder import start_mock_invite_responder
+          server = start_mock_invite_responder(destination_behaviors={'voipaudit-transfer-test': 'answer_then_refer_accepted'})
+          with open('/tmp/transfer_mock_port.txt', 'w') as f:
+              f.write(str(server.port))
+          time.sleep(30)
+          " > /tmp/transfer_mock.log 2>&1 &
+          TRANSFER_MOCK_PID=$!
+          for i in $(seq 1 20); do
+            if [ -f /tmp/transfer_mock_port.txt ]; then break; fi
+            sleep 0.5
+          done
+          TRANSFER_PORT=$(cat /tmp/transfer_mock_port.txt)
+          echo "Mock REFER-accepting responder on port $TRANSFER_PORT"
+
+          $VA scan "127.0.0.1:$TRANSFER_PORT" --modules refer_transfer_abuse --confirm ci-invite-test \
+            -a invite_authorization.yml --json /tmp/transfer_findings.json || true
+          cat /tmp/transfer_findings.json
+          python3 -c "
+          import json
+          findings = json.load(open('/tmp/transfer_findings.json'))
+          assert any(f['severity'] == 'HIGH' and 'honor' in f['title'].lower() for f in findings), f'expected a HIGH honored-transfer finding not found: {findings}'
+          print(f'OK: {len(findings)} finding(s), including the expected HIGH honored-transfer finding')
+          "
+
+          kill $TRANSFER_MOCK_PID 2>/dev/null || true
+          echo "::endgroup::"
+
           kill $MOCK_PID 2>/dev/null || true
           echo "All integration checks passed."
