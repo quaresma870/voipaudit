@@ -168,19 +168,76 @@ shift based on what turns out to matter most in practice.
   (`_TCPMessageReader`) that correctly bounds each message and
   preserves leftover bytes for the next read.
 
+### v0.7.0
+- **TLS support for `core/invite_probe.py`** (and therefore both
+  invite-tier plugins, via `--transport tls` on `scan`, alongside the
+  existing udp/tcp): a new `_TLSTransport`, layered directly on top of
+  `_TCPTransport` (an SSL-wrapped socket exposes the same
+  sendall()/recv() surface, so send()/receive_one() are inherited
+  unchanged) — only the handshake/certificate-verification setup
+  mirrors core/sip.py's own `_build_tls_context`/`--insecure` handling,
+  reused directly rather than reimplemented. `toll_fraud_exposure` and
+  `srtp_check` both gained a `tls_verify` parameter passed through from
+  `--insecure`, and the CLI's previous explicit refusal of
+  `--transport tls` for either was removed. All 5 response scenarios
+  already proven over UDP/TCP (outright rejection, ringing-then-
+  silence, immediate answer, trying-then-silence, total silence)
+  re-verified over TLS against the mock responder's new TLS listener,
+  plus TLS's own distinct failure mode (certificate verification
+  failure surfaced as a clear, actionable `InviteProbeError`).
+- Found and fixed a real, reproducible concurrency bug in the TEST
+  FIXTURE while verifying TLS INVITE probing (not just accepted the
+  design as correct): `tests/fixtures/mock_pbx/invite_responder.py`'s
+  connection handler read incoming data on its own thread while a
+  separately-dispatched thread sent the computed response on the SAME
+  socket — safe for a plain TCP socket (the kernel handles full-duplex
+  access from two threads fine, no shared mutable state between the
+  read and write paths) but NOT safe for an SSLSocket, where OpenSSL's
+  per-connection record-layer state can be corrupted by a genuinely
+  concurrent SSL_read() and SSL_write(), reproduced directly (~30-40%
+  of runs, instrumented on both client and server showing the reading
+  thread's next recv() spuriously returning `b""` — read as "peer
+  closed" — often followed by a client-side `BrokenPipeError`). Fixed
+  by dispatching the response synchronously on the TCP/TLS reading
+  thread instead (safe, since unlike UDP's single shared-socket receive
+  loop, TCP/TLS already get their own dedicated per-connection thread,
+  and no behavior here ever sleeps) while leaving UDP's original async
+  dispatch untouched.
+- **TLS 1.2 decryption support for `analyze-pcap`**: a new
+  `--tls-keylog PATH` option (an SSLKEYLOGFILE — the same NSS Key Log
+  format Wireshark's own "Decrypt TLS traffic" feature consumes) lets
+  `analyze-pcap` decrypt TLS/SIPS-carried SIP traffic before parsing.
+  Reuses scapy's own TLS layer (`scapy.layers.tls`) for the actual
+  cryptography — a real, audited implementation, not a hand-rolled key
+  schedule — combined with a new TLS-record reassembler
+  (`core/pcap_parser.py`'s `_decrypt_tls_flow`) that buffers each
+  direction's TCP stream and extracts complete TLS records via the
+  record header's own length field, mirroring the same
+  buffer-and-frame approach TCP SIP reassembly already uses one layer
+  up. Deliberately scoped to TLS 1.2 only, confirmed by direct testing
+  rather than assumed: verified end-to-end against a real TLS 1.2
+  exchange (real client_random/master_secret-based decryption, real SIP
+  plaintext recovered, including a record deliberately split across 2
+  TCP segments). TLS 1.3 was tested the same way and found to fail
+  partway through scapy's own key-schedule handling (confirmed against
+  a real TLS 1.3 exchange + keylog — some records silently decrypted to
+  the wrong plaintext, others raised outright) — a real, tracked gap in
+  scapy's own TLS 1.3 support, left as a further open gap rather than
+  worked around by reimplementing TLS 1.3's key schedule by hand. A
+  pcap with a TLS 1.3 SIP session, or the wrong keylog for a session,
+  simply yields no decrypted messages (silently, same as any other
+  undecryptable/non-SIP traffic), not a crash or wrong output — verified
+  directly, not assumed.
+
 ## Next
 
-### TLS pcap/INVITE support
-Both `analyze-pcap` and `core/invite_probe.py` now support UDP and TCP,
-but not TLS (SIPS) — a real, tracked gap for both. For pcap, this would
-mean decrypting a captured TLS session (only possible with the session
-keys, e.g. via a keylog file, the same approach Wireshark itself uses)
-before SIP parsing can even begin. For live INVITE probing, this means
-extending `core/invite_probe.py`'s `_Transport` abstraction with a
-third `_TLSTransport` wrapping `_TCPTransport`'s framing logic around
-an `ssl`-wrapped socket — the same `--insecure`/certificate-verification
-reasoning already established for `transport_security`'s own TLS
-handling would apply directly.
+### TLS 1.3 pcap decryption support
+`analyze-pcap --tls-keylog` decrypts TLS 1.2 only (see v0.7.0 above for
+why) — a real, tracked gap for TLS 1.3-negotiated SIP/TLS captures
+specifically. Revisit once scapy's own TLS 1.3 support matures, or if a
+real need to hand-implement the TLS 1.3 key schedule (HKDF-based,
+distinct from 1.2's PRF) against the `cryptography` library directly
+turns up.
 
 ### More PBX fingerprint signatures
 `pbx_fingerprint`'s signature list is a reasonable starting set, not

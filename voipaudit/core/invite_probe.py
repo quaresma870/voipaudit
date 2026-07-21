@@ -21,11 +21,15 @@ answered by the FIRST routing-indicating response. A hard, short
 timeout applies throughout, so even a target that never responds at
 all can't make this probe hang.
 
-UDP and TCP are both supported (transport='udp' default, or 'tcp') via
-a shared _Transport abstraction — the response-handling state machine
-above is completely transport-agnostic, so the CANCEL/ACK+BYE safety
-logic can't diverge between the two paths. TLS (SIPS) INVITE transport
-remains a tracked gap for now (see ROADMAP.md).
+UDP, TCP, and TLS are all supported (transport='udp' default, 'tcp', or
+'tls') via a shared _Transport abstraction — the response-handling
+state machine above is completely transport-agnostic, so the
+CANCEL/ACK+BYE safety logic can't diverge between transports. TLS is
+layered directly on top of _TCPTransport's own connection +
+stream-framing logic, exactly as core/sip.py's own _send_tls already
+does for single-request/response probes — only the handshake/
+certificate-verification setup and a best-effort graceful close_notify
+before teardown are TLS-specific.
 """
 
 from __future__ import annotations
@@ -33,10 +37,12 @@ from __future__ import annotations
 import re
 import secrets
 import socket
+import ssl
 import time
 from dataclasses import dataclass, field
 
 from voipaudit.core.sdp import SDPMediaInfo, parse_sdp
+from voipaudit.core.sip import _build_tls_context
 from voipaudit.core.sip_message import SIPMessage, parse_sip_message
 
 # The longest this probe will ever wait, end to end, for a target that
@@ -335,14 +341,57 @@ class _TCPTransport(_Transport):
         self._sock.close()
 
 
+class _TLSTransport(_TCPTransport):
+    """TLS (SIPS) layered directly on top of _TCPTransport: an
+    SSL-wrapped socket exposes the same sendall()/recv() surface as a
+    plain TCP one, so send()/receive_one() are inherited completely
+    unchanged from _TCPTransport — only connection setup (the TLS
+    handshake and certificate-verification handling, mirroring
+    core/sip.py's _build_tls_context exactly, same --insecure
+    precedent) and teardown are TLS-specific."""
+
+    def __init__(
+        self, target_host: str, target_port: int, local_port: int, connect_timeout: float,
+        tls_verify: bool = True,
+    ):
+        raw_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        if local_port:
+            raw_sock.bind(("0.0.0.0", local_port))
+        raw_sock.settimeout(connect_timeout)
+        ctx = _build_tls_context(tls_verify)
+        self._sock = ctx.wrap_socket(raw_sock, server_hostname=target_host)
+        self._sock.connect((target_host, target_port))
+        self.local_port = self._sock.getsockname()[1]
+        self._buf = b""
+
+    def close(self) -> None:
+        # Best-effort graceful TLS close_notify before tearing down --
+        # the same class of fix _TCPTransport's own shutdown(SHUT_WR)-
+        # before-close() already applies at the plain-TCP level (see
+        # ROADMAP.md's v0.6.0 entry), just at the TLS layer instead. A
+        # peer that doesn't complete the close_notify handshake (many
+        # won't, for a connection that's about to be abandoned anyway)
+        # is not an error worth surfacing -- the probe result itself is
+        # already meaningful regardless of how gracefully this closes.
+        try:
+            self._sock.settimeout(1.0)
+            self._sock.unwrap()
+        except (OSError, ValueError):
+            pass
+        self._sock.close()
+
+
 def _open_transport(
     transport: str, target_host: str, target_port: int, local_port: int, connect_timeout: float,
+    tls_verify: bool = True,
 ) -> _Transport:
     if transport == "udp":
         return _UDPTransport(target_host, target_port, local_port)
     if transport == "tcp":
         return _TCPTransport(target_host, target_port, local_port, connect_timeout)
-    raise ValueError(f"Unsupported transport {transport!r}: must be 'udp' or 'tcp'")
+    if transport == "tls":
+        return _TLSTransport(target_host, target_port, local_port, connect_timeout, tls_verify=tls_verify)
+    raise ValueError(f"Unsupported transport {transport!r}: must be 'udp', 'tcp', or 'tls'")
 
 
 def safe_invite_probe(
@@ -357,6 +406,7 @@ def safe_invite_probe(
     sdp_offer: str | None = None,
     transport: str = "udp",
     connect_timeout: float = 3.0,
+    tls_verify: bool = True,
 ) -> InviteProbeResult:
     """Sends one real INVITE and reacts to whatever comes back,
     cancelling (or ACK+BYE-ing) at the earliest possible moment that
@@ -366,13 +416,17 @@ def safe_invite_probe(
     destinations tested calls this once per destination, each a fully
     independent, individually-timed probe).
 
-    transport selects 'udp' (default) or 'tcp' — the response-handling
-    logic below (deciding when to CANCEL/ACK+BYE) is completely
-    unchanged between the two; only how bytes are sent/received
-    differs, isolated entirely in the _Transport implementations
-    above. For TCP, connect_timeout bounds the initial connection
-    attempt specifically, separate from total_timeout (which bounds
-    waiting for a SIP response once connected).
+    transport selects 'udp' (default), 'tcp', or 'tls' — the
+    response-handling logic below (deciding when to CANCEL/ACK+BYE) is
+    completely unchanged across all three; only how bytes are sent/
+    received differs, isolated entirely in the _Transport
+    implementations above. For TCP/TLS, connect_timeout bounds the
+    initial connection attempt specifically, separate from
+    total_timeout (which bounds waiting for a SIP response once
+    connected). tls_verify (transport='tls' only) mirrors core/sip.py's
+    own --insecure handling exactly: False skips certificate
+    verification, needed to reach a target with a self-signed or
+    otherwise unverifiable certificate at all.
 
     sdp_offer is optional and unused by default (toll_fraud_exposure's
     routing-only checks don't need one) — passed by the SRTP-checking
@@ -388,7 +442,14 @@ def safe_invite_probe(
 
     result = InviteProbeResult()
     try:
-        conn = _open_transport(transport, target_host, target_port, local_port, connect_timeout)
+        conn = _open_transport(
+            transport, target_host, target_port, local_port, connect_timeout, tls_verify=tls_verify,
+        )
+    except ssl.SSLCertVerificationError as exc:
+        raise InviteProbeError(
+            f"TLS certificate verification failed for {target_host}:{target_port}: {exc}. "
+            f"Pass tls_verify=False (--insecure) if this is a known, authorized self-signed target."
+        ) from exc
     except (OSError, ValueError) as exc:
         raise InviteProbeError(
             f"Could not establish a {transport.upper()} connection to {target_host}:{target_port}: {exc}"
