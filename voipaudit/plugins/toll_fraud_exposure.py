@@ -58,12 +58,11 @@ class TollFraudExposureModule(BasePlugin):
     category = "invite"
 
     def __init__(
-        self, engagement, timeout: float = 4.0, transport: str = "udp",
+        self, engagement, timeout: float = 4.0,
         max_destinations: int = _MAX_DESTINATIONS_PER_RUN,
     ):
         super().__init__(engagement)
         self.timeout = timeout
-        self.transport = transport
         self.max_destinations = min(max_destinations, _MAX_DESTINATIONS_PER_RUN)
 
     def scan(self, target: str, **kwargs: Any) -> list[Finding]:

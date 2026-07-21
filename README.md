@@ -42,6 +42,11 @@ TCP, and TLS) plus file-analysis commands:
   below) — sends real, safety-bounded SIP INVITEs toward known
   high-risk destinations to check whether the dialplan would even route
   a call there, auto-cancelling at the earliest possible moment.
+- **`srtp_check`** (**invite tier**, same requirements as above) —
+  checks whether the target actually negotiates SRTP (encrypted media)
+  when offered, using a differential test (an SRTP-only offer vs a
+  plain-RTP-only offer to the same destination) that distinguishes
+  "SRTP not supported" from "destination not reachable at all."
 - **`analyze-cdr`** — parses an Asterisk CDR CSV export and flags
   patterns indicative of toll fraud already having occurred: calls to
   known high-risk international destinations, off-hours call bursts, and
@@ -104,6 +109,7 @@ to the standard SIP UDP port 5060 (RFC 3261 §18.1) when omitted. Add
 | `register_exposed` | active | Detects unauthenticated REGISTER acceptance |
 | `transport_security` | recon | TLS availability, certificate expiry, plaintext-alongside-TLS |
 | `toll_fraud_exposure` | **invite** | Whether the dialplan routes calls toward high-risk destinations |
+| `srtp_check` | **invite** | Whether SRTP (encrypted media) is actually negotiated |
 
 ```bash
 voipaudit list-plugins
@@ -116,12 +122,12 @@ voipaudit scan pbx.example.com --modules transport_security \
 
 ## Invite-tier: real INVITE probing
 
-`toll_fraud_exposure` sends real SIP INVITE requests — categorically
-different from every other probe in this toolkit. A real INVITE can
-ring a phone, or in the worst case be answered and start accruing real
-per-minute cost. This is why invite-tier sits **above** active-tier
-with its own, stricter authorization requirements, rather than being
-folded into `active`:
+`toll_fraud_exposure` and `srtp_check` send real SIP INVITE requests —
+categorically different from every other probe in this toolkit. A real
+INVITE can ring a phone, or in the worst case be answered and start
+accruing real per-minute cost. This is why invite-tier sits **above**
+active-tier with its own, stricter authorization requirements, rather
+than being folded into `active`:
 
 1. **A written acknowledgment in `authorization.yml`.** `invite` in
    `scope.allowed_categories` requires a new field,
@@ -140,6 +146,10 @@ folded into `active`:
 
 ```bash
 voipaudit scan pbx.example.com --modules toll_fraud_exposure --confirm <engagement_id>
+
+# srtp_check tests a specific destination/extension — results are
+# strongest against a known-valid, reachable one:
+voipaudit scan pbx.example.com --modules srtp_check --to-user 1001 --confirm <engagement_id>
 ```
 
 **The safety technique:** as soon as ANY response indicates the call is
@@ -149,11 +159,16 @@ rare instant-answer case, ACK followed immediately by BYE) — see
 `core/invite_probe.py`'s own docstring for the full design. The goal is
 only ever "does the dialplan route this destination at all," never
 "does the call complete." A hard timeout (default 4s) applies
-throughout, and a mandatory 2-second pause separates each destination
-tested, up to a fixed cap of 5 destinations per run. Test destinations
-are drawn from the same `HIGH_RISK_PREFIXES` list `analyze-cdr`/
-`analyze-pcap` already use — see their own documentation above for
-sourcing and the same non-exhaustiveness caveat.
+throughout every single probe, regardless of which plugin sends it.
+
+`toll_fraud_exposure` sweeps a small, fixed sample of destinations
+(default 5, hard-capped), with a mandatory 2-second pause between each
+— drawn from the same `HIGH_RISK_PREFIXES` list `analyze-cdr`/
+`analyze-pcap` already use (see their own documentation above for
+sourcing and the same non-exhaustiveness caveat). `srtp_check` instead
+sends exactly two probes to one destination (an SRTP-only offer, then
+— after the same 2-second pause — a plain-RTP-only offer) to run its
+differential comparison.
 
 ## CDR / toll-fraud analysis
 
@@ -226,6 +241,7 @@ voipaudit/
 │   │   ├── sip.py                # raw SIP (RFC 3261) message construction/parsing/transport
 │   │   ├── sip_message.py        # general SIP message parsing (requests + responses) for captured traffic
 │   │   ├── invite_probe.py       # real INVITE probing with immediate cancel/ack-bye — the safety-critical core
+│   │   ├── sdp.py                # minimal SDP (RFC 4566/4568) construction/parsing for SRTP checking
 │   │   ├── cdr.py                # Asterisk CDR CSV parsing
 │   │   ├── pcap_parser.py        # pcap → SIP call session reconstruction → CDRRecord
 │   │   └── models.py             # Finding, Severity, ModuleResult
@@ -234,19 +250,21 @@ voipaudit/
 │   │   ├── pbx_fingerprint.py
 │   │   ├── register_exposed.py
 │   │   ├── transport_security.py
-│   │   └── toll_fraud_exposure.py    # invite tier — live dialplan-routing exposure check
+│   │   ├── toll_fraud_exposure.py    # invite tier — live dialplan-routing exposure check
+│   │   └── srtp_check.py             # invite tier — differential SRTP-vs-plain-RTP media check
 │   ├── analyzers/
 │   │   └── toll_fraud.py         # CDR-based toll-fraud pattern detection (no Engagement gate — file-only)
 │   └── reports/
 │       └── terminal.py           # Rich-based terminal output
 ├── tests/
 │   ├── fixtures/mock_pbx/server.py            # a real UDP+TCP+TLS SIP server, for tests only
-│   ├── fixtures/mock_pbx/invite_responder.py  # a real, configurable-behavior INVITE responder, for tests only
+│   ├── fixtures/mock_pbx/invite_responder.py  # a real, configurable/offer-aware INVITE responder, for tests only
 │   ├── fixtures/cdr/sample_master.csv
 │   ├── test_voipaudit.py
 │   ├── test_toll_fraud.py
 │   ├── test_pcap_analysis.py     # pcap files generated programmatically via scapy within the tests
-│   └── test_invite_probe.py      # the invite-tier safety infrastructure — tested most thoroughly of all
+│   ├── test_invite_probe.py      # the invite-tier safety infrastructure — tested most thoroughly of all
+│   └── test_srtp_check.py        # SDP construction/parsing + the differential SRTP check
 └── .github/workflows/ci.yml
 ```
 

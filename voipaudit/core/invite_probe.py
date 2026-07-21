@@ -20,6 +20,11 @@ by BYE) — the goal is never to observe "does the call complete," only
 answered by the FIRST routing-indicating response. A hard, short
 timeout applies throughout, so even a target that never responds at
 all can't make this probe hang.
+
+UDP-only for now — a real, tracked limitation (see ROADMAP.md), not an
+oversight: safe_invite_probe uses a single raw UDP socket throughout,
+with no TCP/TLS transport support at all yet, matching the scope of
+this first version.
 """
 
 from __future__ import annotations
@@ -29,6 +34,7 @@ import socket
 import time
 from dataclasses import dataclass, field
 
+from voipaudit.core.sdp import SDPMediaInfo, parse_sdp
 from voipaudit.core.sip_message import SIPMessage, parse_sip_message
 
 # The longest this probe will ever wait, end to end, for a target that
@@ -69,6 +75,7 @@ class InviteProbeResult:
     cancelled: bool = False
     acked_and_byed: bool = False
     timed_out_with_no_response: bool = False
+    answer_sdp: SDPMediaInfo | None = None  # parsed from the last response that carried an SDP body, if any
 
     @property
     def rejected_outright(self) -> bool:
@@ -98,15 +105,20 @@ def _gen_call_id(local_host: str) -> str:
 def build_invite(
     target_host: str, target_port: int, local_host: str, local_port: int,
     from_user: str, to_user: str, branch: str, from_tag: str, call_id: str,
-    user_agent: str = "voipaudit/0.1",
+    user_agent: str = "voipaudit/0.1", sdp_body: str | None = None,
 ) -> bytes:
-    """No SDP body — this probe only needs to observe how the
-    dialplan/routing responds to the request-URI's destination, which
-    doesn't depend on media negotiation at all. Omitting SDP entirely
-    (rather than offering a real or fake media description) is the
-    more conservative choice: nothing here claims any intent to
-    actually exchange media, however briefly."""
+    """No SDP body by default — most callers (toll_fraud_exposure) only
+    need to observe how the dialplan/routing responds to the
+    request-URI's destination, which doesn't depend on media
+    negotiation at all, and omitting SDP entirely is the more
+    conservative choice when it isn't needed: nothing claims any
+    intent to actually exchange media. sdp_body is used specifically
+    by the SRTP-checking plugin, which genuinely needs a real media
+    offer in the INVITE to observe what the far end negotiates back —
+    same immediate-cancel safety reflex applies regardless of whether
+    SDP is present."""
     to_uri = f"sip:{to_user}@{target_host}"
+    body_bytes = sdp_body.encode("utf-8") if sdp_body else b""
     lines = [
         f"INVITE {to_uri} SIP/2.0",
         f"Via: SIP/2.0/UDP {local_host}:{local_port};branch={branch}",
@@ -117,10 +129,13 @@ def build_invite(
         "CSeq: 1 INVITE",
         f"Contact: <sip:{from_user}@{local_host}:{local_port}>",
         f"User-Agent: {user_agent}",
-        "Content-Length: 0",
-        "", "",
     ]
-    return "\r\n".join(lines).encode("utf-8")
+    if sdp_body:
+        lines.append("Content-Type: application/sdp")
+    lines.append(f"Content-Length: {len(body_bytes)}")
+    lines.append("")
+    header_bytes = "\r\n".join(lines).encode("utf-8") + b"\r\n"
+    return header_bytes + body_bytes
 
 
 def build_cancel(
@@ -201,6 +216,7 @@ def safe_invite_probe(
     local_port: int = 0,
     total_timeout: float = DEFAULT_TOTAL_TIMEOUT,
     grace_after_first_response: float = DEFAULT_GRACE_AFTER_FIRST_RESPONSE,
+    sdp_offer: str | None = None,
 ) -> InviteProbeResult:
     """Sends one real INVITE and reacts to whatever comes back,
     cancelling (or ACK+BYE-ing) at the earliest possible moment that
@@ -208,7 +224,16 @@ def safe_invite_probe(
     UDP exchange — no retries, no repeated attempts against the same
     destination within this call (a caller wanting multiple
     destinations tested calls this once per destination, each a fully
-    independent, individually-timed probe)."""
+    independent, individually-timed probe).
+
+    sdp_offer is optional and unused by default (toll_fraud_exposure's
+    routing-only checks don't need one) — passed by the SRTP-checking
+    plugin, which needs a real media offer to observe what the far end
+    negotiates back. Every response carrying a body is parsed as SDP
+    and the last one seen is exposed via result.answer_sdp, regardless
+    of whether sdp_offer was given (a target could in principle include
+    SDP in an unsolicited early-media response even to an offer-less
+    INVITE, though this is rare)."""
     branch = _gen_branch()
     from_tag = _gen_tag()
     call_id = _gen_call_id(local_host if local_host != "0.0.0.0" else "voipaudit")
@@ -221,7 +246,7 @@ def safe_invite_probe(
 
         invite = build_invite(
             target_host, target_port, local_host, actual_local_port,
-            from_user, to_user, branch, from_tag, call_id,
+            from_user, to_user, branch, from_tag, call_id, sdp_body=sdp_offer,
         )
         try:
             sock.sendto(invite, (target_host, target_port))
@@ -249,6 +274,8 @@ def safe_invite_probe(
                 continue  # unrelated traffic hitting the same ephemeral port
 
             result.responses_seen.append(msg)
+            if msg.body and msg.body.strip():
+                result.answer_sdp = parse_sdp(msg.body)
             status = msg.status_code or 0
 
             if status in _ROUTING_INDICATING_PROVISIONAL_CODES:
