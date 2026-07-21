@@ -21,14 +21,16 @@ answered by the FIRST routing-indicating response. A hard, short
 timeout applies throughout, so even a target that never responds at
 all can't make this probe hang.
 
-UDP-only for now — a real, tracked limitation (see ROADMAP.md), not an
-oversight: safe_invite_probe uses a single raw UDP socket throughout,
-with no TCP/TLS transport support at all yet, matching the scope of
-this first version.
+UDP and TCP are both supported (transport='udp' default, or 'tcp') via
+a shared _Transport abstraction — the response-handling state machine
+above is completely transport-agnostic, so the CANCEL/ACK+BYE safety
+logic can't diverge between the two paths. TLS (SIPS) INVITE transport
+remains a tracked gap for now (see ROADMAP.md).
 """
 
 from __future__ import annotations
 
+import re
 import secrets
 import socket
 import time
@@ -105,7 +107,7 @@ def _gen_call_id(local_host: str) -> str:
 def build_invite(
     target_host: str, target_port: int, local_host: str, local_port: int,
     from_user: str, to_user: str, branch: str, from_tag: str, call_id: str,
-    user_agent: str = "voipaudit/0.1", sdp_body: str | None = None,
+    user_agent: str = "voipaudit/0.1", sdp_body: str | None = None, transport: str = "udp",
 ) -> bytes:
     """No SDP body by default — most callers (toll_fraud_exposure) only
     need to observe how the dialplan/routing responds to the
@@ -116,12 +118,17 @@ def build_invite(
     by the SRTP-checking plugin, which genuinely needs a real media
     offer in the INVITE to observe what the far end negotiates back —
     same immediate-cancel safety reflex applies regardless of whether
-    SDP is present."""
+    SDP is present.
+
+    transport sets the Via header's transport token (RFC 3261
+    §18.2.2 — must reflect the transport actually used, the same
+    real, meaningful detail already applied throughout core/sip.py's
+    own OPTIONS/REGISTER message builders)."""
     to_uri = f"sip:{to_user}@{target_host}"
     body_bytes = sdp_body.encode("utf-8") if sdp_body else b""
     lines = [
         f"INVITE {to_uri} SIP/2.0",
-        f"Via: SIP/2.0/UDP {local_host}:{local_port};branch={branch}",
+        f"Via: SIP/2.0/{transport.upper()} {local_host}:{local_port};branch={branch}",
         "Max-Forwards: 70",
         f"From: <sip:{from_user}@{local_host}>;tag={from_tag}",
         f"To: <{to_uri}>",
@@ -141,6 +148,7 @@ def build_invite(
 def build_cancel(
     target_host: str, target_port: int, local_host: str, local_port: int,
     from_user: str, to_user: str, branch: str, from_tag: str, call_id: str,
+    transport: str = "udp",
 ) -> bytes:
     """RFC 3261 §9.1: CANCEL MUST use the exact same branch, Call-ID,
     From (with tag), and CSeq NUMBER as the request being cancelled —
@@ -149,7 +157,7 @@ def build_cancel(
     to_uri = f"sip:{to_user}@{target_host}"
     lines = [
         f"CANCEL {to_uri} SIP/2.0",
-        f"Via: SIP/2.0/UDP {local_host}:{local_port};branch={branch}",
+        f"Via: SIP/2.0/{transport.upper()} {local_host}:{local_port};branch={branch}",
         "Max-Forwards: 70",
         f"From: <sip:{from_user}@{local_host}>;tag={from_tag}",
         f"To: <{to_uri}>",
@@ -164,6 +172,7 @@ def build_cancel(
 def build_ack(
     target_host: str, target_port: int, local_host: str, local_port: int,
     from_user: str, to_user: str, branch: str, from_tag: str, to_tag: str, call_id: str,
+    transport: str = "udp",
 ) -> bytes:
     """Sent only in the rare case the target answers (2xx) before the
     probe can cancel — RFC 3261 requires ACK for every 2xx response to
@@ -172,7 +181,7 @@ def build_ack(
     to_uri = f"sip:{to_user}@{target_host}"
     lines = [
         f"ACK {to_uri} SIP/2.0",
-        f"Via: SIP/2.0/UDP {local_host}:{local_port};branch={branch}",
+        f"Via: SIP/2.0/{transport.upper()} {local_host}:{local_port};branch={branch}",
         "Max-Forwards: 70",
         f"From: <sip:{from_user}@{local_host}>;tag={from_tag}",
         f"To: <{to_uri}>;tag={to_tag}",
@@ -187,6 +196,7 @@ def build_ack(
 def build_bye(
     target_host: str, target_port: int, local_host: str, local_port: int,
     from_user: str, to_user: str, from_tag: str, to_tag: str, call_id: str,
+    transport: str = "udp",
 ) -> bytes:
     """Ends a call that was unexpectedly answered, immediately after
     the mandatory ACK above — a fresh branch (BYE is a new
@@ -195,7 +205,7 @@ def build_bye(
     branch = _gen_branch()
     lines = [
         f"BYE {to_uri} SIP/2.0",
-        f"Via: SIP/2.0/UDP {local_host}:{local_port};branch={branch}",
+        f"Via: SIP/2.0/{transport.upper()} {local_host}:{local_port};branch={branch}",
         "Max-Forwards: 70",
         f"From: <sip:{from_user}@{local_host}>;tag={from_tag}",
         f"To: <{to_uri}>;tag={to_tag}",
@@ -205,6 +215,134 @@ def build_bye(
         "", "",
     ]
     return "\r\n".join(lines).encode("utf-8")
+
+
+class _Transport:
+    """A minimal send/receive_one/close interface shared by the UDP
+    and TCP implementations below."""
+
+    local_port: int
+
+    def send(self, data: bytes) -> None:
+        raise NotImplementedError
+
+    def receive_one(self, timeout: float) -> bytes | None:
+        raise NotImplementedError
+
+    def close(self) -> None:
+        raise NotImplementedError
+
+
+class _UDPTransport(_Transport):
+    def __init__(self, target_host: str, target_port: int, local_port: int):
+        self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self._sock.bind(("0.0.0.0", local_port))
+        self._target = (target_host, target_port)
+        self.local_port = self._sock.getsockname()[1]
+
+    def send(self, data: bytes) -> None:
+        self._sock.sendto(data, self._target)
+
+    def receive_one(self, timeout: float) -> bytes | None:
+        self._sock.settimeout(max(0.01, timeout))
+        try:
+            data, _addr = self._sock.recvfrom(65535)
+            return data
+        except (TimeoutError, OSError):
+            return None
+
+    def close(self) -> None:
+        self._sock.close()
+
+
+class _TCPTransport(_Transport):
+    """Connects once, reuses the same connection for the INVITE and
+    every follow-up (CANCEL, or ACK+BYE) — the common, interoperable
+    behavior for SIP-over-TCP, and simpler than reconnecting per
+    message. Framing mirrors core/sip.py's own _read_sip_message
+    (Content-Length-aware, buffering any bytes read past the current
+    message's end for the next receive_one() call)."""
+
+    def __init__(self, target_host: str, target_port: int, local_port: int, connect_timeout: float):
+        self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        if local_port:
+            self._sock.bind(("0.0.0.0", local_port))
+        self._sock.settimeout(connect_timeout)
+        self._sock.connect((target_host, target_port))
+        self.local_port = self._sock.getsockname()[1]
+        self._buf = b""
+
+    def send(self, data: bytes) -> None:
+        self._sock.sendall(data)
+
+    def receive_one(self, timeout: float) -> bytes | None:
+        deadline = time.monotonic() + timeout
+        while b"\r\n\r\n" not in self._buf:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+            self._sock.settimeout(max(0.01, remaining))
+            try:
+                chunk = self._sock.recv(4096)
+            except (TimeoutError, OSError):
+                return None
+            if not chunk:
+                return None
+            self._buf += chunk
+
+        header_end = self._buf.find(b"\r\n\r\n")
+        header_bytes = self._buf[:header_end]
+        match = re.search(rb"^content-length\s*:\s*(\d+)\s*$", header_bytes, re.IGNORECASE | re.MULTILINE)
+        content_length = int(match.group(1)) if match else 0
+        message_end = header_end + 4 + content_length
+
+        while len(self._buf) < message_end:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+            self._sock.settimeout(max(0.01, remaining))
+            try:
+                chunk = self._sock.recv(4096)
+            except (TimeoutError, OSError):
+                return None
+            if not chunk:
+                return None
+            self._buf += chunk
+
+        message, self._buf = self._buf[:message_end], self._buf[message_end:]
+        return message
+
+    def close(self) -> None:
+        # Confirmed a real, reproducible bug here (not theoretical):
+        # calling close() immediately after the final send() (e.g.
+        # BYE, sent right before this) intermittently dropped that
+        # last message -- reproduced directly with server-side
+        # instrumentation showing ACK always arrived but BYE didn't
+        # ~40% of the time. A plain close() on a socket that may still
+        # have unread incoming data buffered, or hasn't fully flushed
+        # its own outstanding writes, can trigger an abrupt RST
+        # instead of a graceful FIN, which can discard recently-sent,
+        # not-yet-acknowledged data. shutdown(SHUT_WR) signals "no
+        # more data from me" gracefully first, giving the OS a proper
+        # chance to flush pending writes before the socket is actually
+        # torn down -- the same class of fix already needed (for TLS's
+        # own unwrap()-before-close()) in the sibling camara-audit
+        # repo's mock gateway.
+        try:
+            self._sock.shutdown(socket.SHUT_WR)
+        except OSError:
+            pass  # already closed or reset by the peer -- nothing more to gracefully signal
+        self._sock.close()
+
+
+def _open_transport(
+    transport: str, target_host: str, target_port: int, local_port: int, connect_timeout: float,
+) -> _Transport:
+    if transport == "udp":
+        return _UDPTransport(target_host, target_port, local_port)
+    if transport == "tcp":
+        return _TCPTransport(target_host, target_port, local_port, connect_timeout)
+    raise ValueError(f"Unsupported transport {transport!r}: must be 'udp' or 'tcp'")
 
 
 def safe_invite_probe(
@@ -217,14 +355,24 @@ def safe_invite_probe(
     total_timeout: float = DEFAULT_TOTAL_TIMEOUT,
     grace_after_first_response: float = DEFAULT_GRACE_AFTER_FIRST_RESPONSE,
     sdp_offer: str | None = None,
+    transport: str = "udp",
+    connect_timeout: float = 3.0,
 ) -> InviteProbeResult:
     """Sends one real INVITE and reacts to whatever comes back,
     cancelling (or ACK+BYE-ing) at the earliest possible moment that
     tells us what we need to know. This is a single, self-contained
-    UDP exchange — no retries, no repeated attempts against the same
+    exchange — no retries, no repeated attempts against the same
     destination within this call (a caller wanting multiple
     destinations tested calls this once per destination, each a fully
     independent, individually-timed probe).
+
+    transport selects 'udp' (default) or 'tcp' — the response-handling
+    logic below (deciding when to CANCEL/ACK+BYE) is completely
+    unchanged between the two; only how bytes are sent/received
+    differs, isolated entirely in the _Transport implementations
+    above. For TCP, connect_timeout bounds the initial connection
+    attempt specifically, separate from total_timeout (which bounds
+    waiting for a SIP response once connected).
 
     sdp_offer is optional and unused by default (toll_fraud_exposure's
     routing-only checks don't need one) — passed by the SRTP-checking
@@ -238,18 +386,21 @@ def safe_invite_probe(
     from_tag = _gen_tag()
     call_id = _gen_call_id(local_host if local_host != "0.0.0.0" else "voipaudit")
 
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     result = InviteProbeResult()
     try:
-        sock.bind(("0.0.0.0", local_port))
-        actual_local_port = sock.getsockname()[1]
+        conn = _open_transport(transport, target_host, target_port, local_port, connect_timeout)
+    except (OSError, ValueError) as exc:
+        raise InviteProbeError(
+            f"Could not establish a {transport.upper()} connection to {target_host}:{target_port}: {exc}"
+        ) from exc
 
+    try:
         invite = build_invite(
-            target_host, target_port, local_host, actual_local_port,
-            from_user, to_user, branch, from_tag, call_id, sdp_body=sdp_offer,
+            target_host, target_port, local_host, conn.local_port,
+            from_user, to_user, branch, from_tag, call_id, sdp_body=sdp_offer, transport=transport,
         )
         try:
-            sock.sendto(invite, (target_host, target_port))
+            conn.send(invite)
         except OSError as exc:
             raise InviteProbeError(f"Could not send INVITE to {target_host}:{target_port}: {exc}") from exc
 
@@ -258,12 +409,8 @@ def safe_invite_probe(
 
         while time.monotonic() < deadline:
             remaining = deadline - time.monotonic()
-            sock.settimeout(max(0.05, remaining))
-            try:
-                data, _addr = sock.recvfrom(65535)
-            except TimeoutError:
-                break
-            except OSError:
+            data = conn.receive_one(remaining)
+            if data is None:
                 break
 
             try:
@@ -271,7 +418,7 @@ def safe_invite_probe(
             except Exception:
                 continue  # not a parseable SIP message -- ignore and keep waiting
             if msg.is_request or msg.call_id != call_id:
-                continue  # unrelated traffic hitting the same ephemeral port
+                continue  # unrelated traffic hitting the same connection/port
 
             result.responses_seen.append(msg)
             if msg.body and msg.body.strip():
@@ -280,8 +427,8 @@ def safe_invite_probe(
 
             if status in _ROUTING_INDICATING_PROVISIONAL_CODES:
                 result.appears_routed = True
-                _send_cancel_and_drain(sock, target_host, target_port, local_host, actual_local_port,
-                                        from_user, to_user, branch, from_tag, call_id, result)
+                _send_cancel_and_drain(conn, target_host, target_port, local_host, conn.local_port,
+                                        from_user, to_user, branch, from_tag, call_id, result, transport)
                 return result
 
             if 200 <= status < 300:
@@ -289,8 +436,8 @@ def safe_invite_probe(
                 result.final_status_code = status
                 to_tag = _extract_to_tag(msg)
                 if to_tag:
-                    _send_ack_and_bye(sock, target_host, target_port, local_host, actual_local_port,
-                                       from_user, to_user, branch, from_tag, to_tag, call_id, result)
+                    _send_ack_and_bye(conn, target_host, target_port, local_host, conn.local_port,
+                                       from_user, to_user, branch, from_tag, to_tag, call_id, result, transport)
                 return result
 
             if status >= 300:
@@ -307,35 +454,45 @@ def safe_invite_probe(
             # Got at least a 100 Trying but nothing more definitive
             # within the grace period -- cancel to be safe, even
             # though nothing routing-indicating was ever confirmed.
-            _send_cancel_and_drain(sock, target_host, target_port, local_host, actual_local_port,
-                                    from_user, to_user, branch, from_tag, call_id, result)
+            _send_cancel_and_drain(conn, target_host, target_port, local_host, conn.local_port,
+                                    from_user, to_user, branch, from_tag, call_id, result, transport)
         return result
     finally:
-        sock.close()
+        conn.close()
 
 
 def _send_cancel_and_drain(
-    sock: socket.socket, target_host: str, target_port: int, local_host: str, local_port: int,
+    conn: _Transport, target_host: str, target_port: int, local_host: str, local_port: int,
     from_user: str, to_user: str, branch: str, from_tag: str, call_id: str, result: InviteProbeResult,
+    transport: str,
 ) -> None:
-    cancel = build_cancel(target_host, target_port, local_host, local_port, from_user, to_user, branch, from_tag, call_id)
+    cancel = build_cancel(
+        target_host, target_port, local_host, local_port, from_user, to_user, branch, from_tag, call_id,
+        transport=transport,
+    )
     try:
-        sock.sendto(cancel, (target_host, target_port))
+        conn.send(cancel)
         result.cancelled = True
     except OSError:
         pass  # best-effort -- the probe result itself is already meaningful regardless
 
 
 def _send_ack_and_bye(
-    sock: socket.socket, target_host: str, target_port: int, local_host: str, local_port: int,
+    conn: _Transport, target_host: str, target_port: int, local_host: str, local_port: int,
     from_user: str, to_user: str, branch: str, from_tag: str, to_tag: str, call_id: str,
-    result: InviteProbeResult,
+    result: InviteProbeResult, transport: str,
 ) -> None:
-    ack = build_ack(target_host, target_port, local_host, local_port, from_user, to_user, branch, from_tag, to_tag, call_id)
-    bye = build_bye(target_host, target_port, local_host, local_port, from_user, to_user, from_tag, to_tag, call_id)
+    ack = build_ack(
+        target_host, target_port, local_host, local_port, from_user, to_user, branch, from_tag, to_tag, call_id,
+        transport=transport,
+    )
+    bye = build_bye(
+        target_host, target_port, local_host, local_port, from_user, to_user, from_tag, to_tag, call_id,
+        transport=transport,
+    )
     try:
-        sock.sendto(ack, (target_host, target_port))
-        sock.sendto(bye, (target_host, target_port))
+        conn.send(ack)
+        conn.send(bye)
         result.acked_and_byed = True
     except OSError:
         pass

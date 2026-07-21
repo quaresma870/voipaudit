@@ -170,6 +170,14 @@ sends exactly two probes to one destination (an SRTP-only offer, then
 — after the same 2-second pause — a plain-RTP-only offer) to run its
 differential comparison.
 
+Both invite-tier plugins support `--transport udp` (default) or `tcp`
+— the same safety reflex (immediate CANCEL/ACK+BYE) applies identically
+regardless of transport, verified against a real, dedicated mock
+responder over both. `--transport tls` isn't supported yet for these
+two plugins specifically (a real, tracked gap — see
+[ROADMAP.md](ROADMAP.md)); `scan` refuses it explicitly for them rather
+than failing per-destination at INVITE-send time.
+
 ## CDR / toll-fraud analysis
 
 ```bash
@@ -206,9 +214,11 @@ same `analyze_toll_fraud()` used by `analyze-cdr` — no changes needed to
 the analysis logic itself, since the output is the same `CDRRecord`
 shape either way. This works against any SBC/PBX vendor's traffic, not
 just Asterisk, since SIP itself (not any particular CDR export format)
-is what every one of them actually speaks on the wire. Only UDP SIP
-transport is parsed in this first version — see
-[ROADMAP.md](ROADMAP.md).
+is what every one of them actually speaks on the wire. Both UDP and TCP
+SIP transport are parsed (TCP via correct sequence-number-ordered stream
+reassembly, handling messages split across multiple segments or several
+messages coalesced into one) — see [ROADMAP.md](ROADMAP.md) for the
+remaining TLS pcap gap.
 
 This is a genuinely different feature from `scan`'s live probing — see
 [ROADMAP.md](ROADMAP.md) for why toll-fraud detection was deliberately
@@ -240,10 +250,10 @@ voipaudit/
 │   │   ├── rate_limit.py         # conservative SIP-specific rate budget defaults
 │   │   ├── sip.py                # raw SIP (RFC 3261) message construction/parsing/transport
 │   │   ├── sip_message.py        # general SIP message parsing (requests + responses) for captured traffic
-│   │   ├── invite_probe.py       # real INVITE probing with immediate cancel/ack-bye — the safety-critical core
+│   │   ├── invite_probe.py       # real INVITE probing with immediate cancel/ack-bye — the safety-critical core (UDP+TCP)
 │   │   ├── sdp.py                # minimal SDP (RFC 4566/4568) construction/parsing for SRTP checking
 │   │   ├── cdr.py                # Asterisk CDR CSV parsing
-│   │   ├── pcap_parser.py        # pcap → SIP call session reconstruction → CDRRecord
+│   │   ├── pcap_parser.py        # pcap → SIP call session reconstruction → CDRRecord (UDP+TCP)
 │   │   └── models.py             # Finding, Severity, ModuleResult
 │   ├── plugins/
 │   │   ├── base.py               # BasePlugin — every plugin's scan() must call authorize_action()
@@ -258,11 +268,12 @@ voipaudit/
 │       └── terminal.py           # Rich-based terminal output
 ├── tests/
 │   ├── fixtures/mock_pbx/server.py            # a real UDP+TCP+TLS SIP server, for tests only
-│   ├── fixtures/mock_pbx/invite_responder.py  # a real, configurable/offer-aware INVITE responder, for tests only
+│   ├── fixtures/mock_pbx/invite_responder.py  # a real, configurable/offer-aware UDP+TCP INVITE responder, for tests only
 │   ├── fixtures/cdr/sample_master.csv
 │   ├── test_voipaudit.py
 │   ├── test_toll_fraud.py
 │   ├── test_pcap_analysis.py     # pcap files generated programmatically via scapy within the tests
+│   ├── test_pcap_tcp.py          # TCP stream reassembly — split/coalesced messages, out-of-order segments
 │   ├── test_invite_probe.py      # the invite-tier safety infrastructure — tested most thoroughly of all
 │   └── test_srtp_check.py        # SDP construction/parsing + the differential SRTP check
 └── .github/workflows/ci.yml

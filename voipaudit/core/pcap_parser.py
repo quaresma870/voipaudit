@@ -23,6 +23,7 @@ unchanged against pcap-derived data.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
@@ -50,11 +51,7 @@ class _Dialog:
 
 def _extract_udp_payloads(pcap_path: str) -> list[tuple[datetime, bytes]]:
     """Reads every UDP packet's payload from the pcap, paired with its
-    capture timestamp. TCP SIP transport is a documented, tracked
-    limitation for this first version — see ROADMAP.md; the
-    overwhelming majority of real-world SIP trunk traffic (and
-    therefore what a SPAN-port/tcpdump capture actually contains) is
-    UDP."""
+    capture timestamp."""
     try:
         from scapy.all import IP, UDP, rdpcap
     except ImportError as exc:
@@ -75,18 +72,129 @@ def _extract_udp_payloads(pcap_path: str) -> list[tuple[datetime, bytes]]:
     return payloads
 
 
+def _extract_tcp_sip_messages(pcap_path: str) -> list[_TimestampedMessage]:
+    """TCP is a byte stream, not datagram-framed like UDP — one packet
+    doesn't reliably correspond to one SIP message (a message can be
+    split across several packets, or several messages coalesced into
+    one). This reassembles each unidirectional TCP flow's byte stream
+    in sequence-number order, then extracts complete SIP messages from
+    it via Content-Length framing, mirroring the exact same framing
+    logic core/sip.py's own _read_sip_message already uses for live
+    TCP scanning — the only difference here is reading from an
+    already-fully-captured buffer instead of a live socket.
+
+    Grouped by UNIDIRECTIONAL flow (src_ip, src_port, dst_ip, dst_port)
+    deliberately, not by bidirectional connection: each direction of a
+    TCP connection has its own independent sequence-number space and
+    needs reassembling separately, and since SIP messages are
+    self-contained regardless of direction (a request stream carries
+    INVITE/ACK/BYE, a response stream carries SIP/2.0 status lines),
+    there's no need to interleave the two directions for parsing."""
+    try:
+        from scapy.all import IP, TCP, rdpcap
+    except ImportError as exc:
+        raise PcapParseError(
+            "The 'scapy' package is required for pcap parsing but isn't installed."
+        ) from exc
+
+    try:
+        packets = rdpcap(pcap_path)
+    except (OSError, Exception) as exc:
+        raise PcapParseError(f"Could not read pcap file {pcap_path!r}: {exc}") from exc
+
+    streams: dict[tuple, list[tuple[int, float, bytes]]] = {}
+    for pkt in packets:
+        if IP not in pkt or TCP not in pkt:
+            continue
+        payload = bytes(pkt[TCP].payload)
+        if not payload:
+            continue  # a pure ACK or other zero-payload segment -- nothing to reassemble
+        flow_key = (pkt[IP].src, pkt[TCP].sport, pkt[IP].dst, pkt[TCP].dport)
+        streams.setdefault(flow_key, []).append((pkt[TCP].seq, float(pkt.time), payload))
+
+    messages: list[_TimestampedMessage] = []
+    for segments in streams.values():
+        # Real captures are very often already in order, but sorting
+        # by TCP sequence number is what makes reassembly correct
+        # regardless -- a segment retransmission or a capture that
+        # merely recorded packets slightly out of arrival order would
+        # otherwise corrupt the reassembled stream.
+        segments.sort(key=lambda s: s[0])
+        messages.extend(_reassemble_stream_into_messages(segments))
+    return messages
+
+
+def _reassemble_stream_into_messages(segments: list[tuple[int, float, bytes]]) -> list[_TimestampedMessage]:
+    buf = b""
+    # Tracks, for each byte offset already appended to buf, which
+    # segment's timestamp contributed it -- so each extracted message
+    # can be timestamped by when its FIRST byte actually arrived on
+    # the wire, not just whichever segment happened to complete it.
+    offset_timestamps: list[tuple[int, float]] = []
+    for _seq, ts, payload in segments:
+        offset_timestamps.append((len(buf), ts))
+        buf += payload
+
+    messages: list[_TimestampedMessage] = []
+    cursor = 0
+    while True:
+        header_end = buf.find(b"\r\n\r\n", cursor)
+        if header_end == -1:
+            break  # no complete header block left in the buffer -- a partial message trailing off, discarded
+
+        header_bytes = buf[cursor:header_end]
+        match = re.search(rb"^content-length\s*:\s*(\d+)\s*$", header_bytes, re.IGNORECASE | re.MULTILINE)
+        content_length = int(match.group(1)) if match else 0
+
+        body_start = header_end + 4
+        body_end = body_start + content_length
+        if body_end > len(buf):
+            break  # the body hasn't fully arrived in this stream yet -- discarded rather than guessed at
+
+        raw_message = buf[cursor:body_end]
+        message_ts = _timestamp_for_offset(offset_timestamps, cursor)
+        try:
+            parsed = parse_sip_message(raw_message)
+            messages.append(_TimestampedMessage(timestamp=message_ts, message=parsed))
+        except SIPParseError:
+            pass  # not a real SIP message after all -- skip and continue past it
+
+        cursor = body_end
+
+    return messages
+
+
+def _timestamp_for_offset(offset_timestamps: list[tuple[int, float]], offset: int) -> datetime:
+    """The timestamp of whichever segment's byte range contains
+    `offset` — i.e. when the first byte of a message-at-this-offset
+    actually arrived, not an average or the stream's overall start."""
+    best = offset_timestamps[0][1]
+    for seg_offset, ts in offset_timestamps:
+        if seg_offset <= offset:
+            best = ts
+        else:
+            break
+    return datetime.fromtimestamp(best, tz=UTC)
+
+
 def parse_pcap_sip_messages(pcap_path: str) -> list[_TimestampedMessage]:
-    """Extracts every parseable SIP message from a pcap file, in
-    capture order. Payloads that don't parse as SIP (any other UDP
-    traffic sharing the capture) are silently skipped — this is the
-    expected, common case for a real SPAN-port capture, not an error."""
-    messages = []
+    """Extracts every parseable SIP message from a pcap file, across
+    both UDP and TCP transports, in capture order. Payloads that don't
+    parse as SIP (any other traffic sharing the capture) are silently
+    skipped — this is the expected, common case for a real
+    SPAN-port/tcpdump capture, not an error."""
+    messages: list[_TimestampedMessage] = []
+
     for ts, payload in _extract_udp_payloads(pcap_path):
         try:
             msg = parse_sip_message(payload)
         except SIPParseError:
             continue
         messages.append(_TimestampedMessage(timestamp=ts, message=msg))
+
+    messages.extend(_extract_tcp_sip_messages(pcap_path))
+
+    messages.sort(key=lambda tm: tm.timestamp)
     return messages
 
 

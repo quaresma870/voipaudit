@@ -348,5 +348,77 @@ jobs:
           kill $SRTP_MOCK_PID 2>/dev/null || true
           echo "::endgroup::"
 
+          echo "::group::analyze-pcap — real TCP stream reassembly (split message across 2 real TCP segments)"
+          /tmp/smoke-venv/bin/python3 -c "
+          import sys, time
+          sys.path.insert(0, '$GITHUB_WORKSPACE')
+          from scapy.all import IP, TCP, Ether, wrpcap
+          base = time.time()
+          call_id = 'ci-tcp-call@test'
+          invite = (
+              f'INVITE sip:252622222222@192.168.1.20 SIP/2.0\r\nFrom: <sip:2004@192.168.1.10>;tag=a1\r\n'
+              f'To: <sip:252622222222@192.168.1.20>\r\nCall-ID: {call_id}\r\nCSeq: 1 INVITE\r\nContent-Length: 0\r\n\r\n'
+          ).encode()
+          ok = (
+              f'SIP/2.0 200 OK\r\nFrom: <sip:2004@192.168.1.10>;tag=a1\r\n'
+              f'To: <sip:252622222222@192.168.1.20>;tag=b1\r\nCall-ID: {call_id}\r\nCSeq: 1 INVITE\r\nContent-Length: 0\r\n\r\n'
+          ).encode()
+          split = len(invite) // 2
+          part1, part2 = invite[:split], invite[split:]
+          def tcp_pkt(payload, seq, t_offset, src, dst):
+              p = Ether()/IP(src=src, dst=dst)/TCP(sport=5060, dport=5060, seq=seq)/payload
+              p.time = base + t_offset
+              return p
+          packets = [
+              tcp_pkt(part1, 1000, 0.0, '192.168.1.10', '192.168.1.20'),
+              tcp_pkt(part2, 1000 + len(part1), 0.02, '192.168.1.10', '192.168.1.20'),
+              tcp_pkt(ok, 5000, 0.1, '192.168.1.20', '192.168.1.10'),
+          ]
+          wrpcap('/tmp/ci_tcp_test.pcap', packets)
+          print('Real synthetic TCP pcap written (INVITE split across 2 real TCP segments)')
+          "
+          $VA analyze-pcap /tmp/ci_tcp_test.pcap --json /tmp/tcp_pcap_findings.json || true
+          cat /tmp/tcp_pcap_findings.json
+          python3 -c "
+          import json
+          findings = json.load(open('/tmp/tcp_pcap_findings.json'))
+          assert any(f['severity'] == 'CRITICAL' and '+252' in f['title'] for f in findings), f'expected +252 finding from the TCP-reassembled call not found: {findings}'
+          print(f'OK: {len(findings)} finding(s), the TCP-split INVITE was correctly reassembled and analyzed')
+          "
+          echo "::endgroup::"
+
+          echo "::group::scan — invite-tier over --transport tcp, real INVITE against the mock responder's TCP listener"
+          /tmp/smoke-venv/bin/python3 -c "
+          import sys, time
+          sys.path.insert(0, '$GITHUB_WORKSPACE')
+          from tests.fixtures.mock_pbx.invite_responder import start_mock_invite_responder
+          from voipaudit.analyzers.toll_fraud import HIGH_RISK_PREFIXES
+          first_prefix = next(iter(HIGH_RISK_PREFIXES))
+          server = start_mock_invite_responder(destination_behaviors={first_prefix + '5550100': 'ring_then_silence'})
+          with open('/tmp/tcp_invite_mock_port.txt', 'w') as f:
+              f.write(str(server.tcp_port))
+          time.sleep(30)
+          " > /tmp/tcp_invite_mock.log 2>&1 &
+          TCP_INVITE_MOCK_PID=$!
+          for i in $(seq 1 20); do
+            if [ -f /tmp/tcp_invite_mock_port.txt ]; then break; fi
+            sleep 0.5
+          done
+          TCP_INVITE_PORT=$(cat /tmp/tcp_invite_mock_port.txt)
+          echo "Mock INVITE responder TCP port: $TCP_INVITE_PORT"
+
+          $VA scan "127.0.0.1:$TCP_INVITE_PORT" --modules toll_fraud_exposure --transport tcp \
+            --confirm ci-invite-test -a invite_authorization.yml --json /tmp/tcp_invite_findings.json || true
+          cat /tmp/tcp_invite_findings.json
+          python3 -c "
+          import json
+          findings = json.load(open('/tmp/tcp_invite_findings.json'))
+          assert any(f['severity'] == 'CRITICAL' and 'route' in f['title'].lower() for f in findings), f'expected a CRITICAL routing finding over TCP not found: {findings}'
+          print(f'OK: {len(findings)} finding(s), including the expected CRITICAL routing finding over TCP')
+          "
+
+          kill $TCP_INVITE_MOCK_PID 2>/dev/null || true
+          echo "::endgroup::"
+
           kill $MOCK_PID 2>/dev/null || true
           echo "All integration checks passed."

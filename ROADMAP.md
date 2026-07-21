@@ -120,19 +120,67 @@ shift based on what turns out to matter most in practice.
   plugin as "active," hiding the invite-tier distinction entirely —
   fixed to show all three tiers correctly.
 
+### v0.6.0
+- **TCP support for `analyze-pcap`**: TCP is a byte stream, not
+  datagram-framed like UDP, so a single packet doesn't reliably
+  correspond to one SIP message. Reassembles each unidirectional TCP
+  flow's byte stream in sequence-number order, then extracts complete
+  messages via Content-Length framing (mirroring `core/sip.py`'s own
+  live-scanning TCP framing logic). Verified against real, scapy-crafted
+  TCP captures covering: a message split across 2 and 3 segments, two
+  messages coalesced into one segment, out-of-order segments (sorted
+  correctly by sequence number regardless of file order), zero-payload
+  ACK segments (correctly ignored), and a mixed UDP+TCP capture (both
+  extracted correctly into separate records).
+- **TCP support for `core/invite_probe.py`** (and therefore both
+  invite-tier plugins, via a new `--transport udp|tcp` option on
+  `scan`): re-added `toll_fraud_exposure`'s previously-removed
+  `transport` parameter, this time genuinely wired through. The
+  response-handling state machine that decides when to CANCEL/ACK+BYE
+  was deliberately extracted into a shared `_Transport` interface
+  (`_UDPTransport`/`_TCPTransport`) so that safety-critical logic stays
+  byte-for-byte identical between transports rather than risking two
+  separately maintained, potentially diverging copies. All 5 of the
+  same response scenarios already proven over UDP (outright rejection,
+  ringing-then-silence, immediate answer, trying-then-silence, total
+  silence) re-verified over TCP against the mock responder's TCP
+  listener, plus TCP's own distinct failure mode (connection refused).
+- Found and fixed a real, reproducible race condition while verifying
+  TCP INVITE probing (not just accepted the design as correct):
+  closing the TCP connection immediately after sending ACK then BYE
+  intermittently dropped the BYE message specifically (~40% of runs,
+  reproduced directly with server-side instrumentation showing ACK
+  always arrived but BYE didn't) — a plain `close()` on a socket that
+  hasn't fully flushed its own outstanding writes can trigger an
+  abrupt RST instead of a graceful FIN, discarding recently-sent,
+  not-yet-acknowledged data. Fixed with `shutdown(SHUT_WR)` before
+  `close()`, the same class of fix already needed (TLS's own
+  `unwrap()`-before-`close()`) in the sibling camara-audit repo's mock
+  gateway. A second, distinct bug was found investigating why the fix
+  alone didn't fully resolve it: the TEST FIXTURE's own TCP message
+  reader used a fresh, stateless buffer per read call, so when ACK and
+  BYE arrived coalesced in a single `recv()`, the zero-Content-Length
+  ACK message's "body" was incorrectly computed as *everything after
+  its header block* rather than correctly bounded to its own
+  Content-Length — silently absorbing BYE's bytes into ACK's return
+  value with no persisted buffer to recover them from. Fixed with a
+  proper stateful, per-connection message reader
+  (`_TCPMessageReader`) that correctly bounds each message and
+  preserves leftover bytes for the next read.
+
 ## Next
 
-### TCP pcap support
-`analyze-pcap` only extracts UDP payloads in this first version — the
-overwhelming majority of real-world SIP trunk traffic is UDP, but a TCP
-capture (or a mixed one) currently has its TCP-carried SIP messages
-silently missed. TCP SIP reassembly (handling messages split or
-coalesced across TCP segments, unlike UDP's one-datagram-one-message
-guarantee) is a real, separate parsing problem worth its own careful
-implementation, not a quick follow-on to the UDP path. The same UDP-only
-limitation now also applies to `core/invite_probe.py` (and therefore
-both invite-tier plugins) — TCP/TLS INVITE support is a related, but
-separate, follow-on.
+### TLS pcap/INVITE support
+Both `analyze-pcap` and `core/invite_probe.py` now support UDP and TCP,
+but not TLS (SIPS) — a real, tracked gap for both. For pcap, this would
+mean decrypting a captured TLS session (only possible with the session
+keys, e.g. via a keylog file, the same approach Wireshark itself uses)
+before SIP parsing can even begin. For live INVITE probing, this means
+extending `core/invite_probe.py`'s `_Transport` abstraction with a
+third `_TLSTransport` wrapping `_TCPTransport`'s framing logic around
+an `ssl`-wrapped socket — the same `--insecure`/certificate-verification
+reasoning already established for `transport_security`'s own TLS
+handling would apply directly.
 
 ### More PBX fingerprint signatures
 `pbx_fingerprint`'s signature list is a reasonable starting set, not

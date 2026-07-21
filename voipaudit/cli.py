@@ -229,26 +229,34 @@ def scan(targets, authorization, audit_log, modules, confirm, timeout, transport
         results = []
         for mod_name in selected:
             plugin_cls = _PLUGIN_CLASSES[mod_name]
-            # transport_security, toll_fraud_exposure, and srtp_check
-            # each have a genuinely different constructor shape from
-            # the transport/tls_verify pattern the other plugins
-            # share — transport_security always probes TLS + plaintext
-            # together regardless of --transport; toll_fraud_exposure
-            # and srtp_check both use core/invite_probe.py, which is
-            # UDP-only for now (a real, tracked gap — see ROADMAP.md),
-            # so neither takes a transport/tls_verify concept at all.
+            # transport_security has a genuinely different shape from
+            # the rest (it always probes TLS + plaintext together
+            # regardless of --transport). toll_fraud_exposure and
+            # srtp_check both use core/invite_probe.py, which supports
+            # 'udp' and 'tcp' but not yet 'tls' (a real, tracked gap —
+            # see ROADMAP.md) — selecting --transport tls for either is
+            # refused explicitly below rather than left to fail
+            # per-destination at INVITE-send time.
             if mod_name == "transport_security":
                 plugin = plugin_cls(
                     eng, timeout=timeout, tls_verify=not insecure,
                     tls_port=tls_port, plaintext_port=plaintext_port,
                 )
-            elif mod_name == "toll_fraud_exposure":
-                plugin = plugin_cls(eng, timeout=timeout)
-            elif mod_name == "srtp_check":
-                kwargs = {"timeout": timeout}
-                if to_user:
-                    kwargs["to_user"] = to_user
-                plugin = plugin_cls(eng, **kwargs)
+            elif mod_name in ("toll_fraud_exposure", "srtp_check"):
+                if transport == "tls":
+                    console.print(
+                        f"[red]✘ {mod_name} doesn't support --transport tls yet "
+                        f"(core/invite_probe.py is udp/tcp only for now).[/red]"
+                    )
+                    exit_code = 1
+                    continue
+                if mod_name == "toll_fraud_exposure":
+                    plugin = plugin_cls(eng, timeout=timeout, transport=transport)
+                else:
+                    kwargs = {"timeout": timeout, "transport": transport}
+                    if to_user:
+                        kwargs["to_user"] = to_user
+                    plugin = plugin_cls(eng, **kwargs)
             else:
                 plugin = plugin_cls(eng, timeout=timeout, transport=transport, tls_verify=not insecure)
             try:
