@@ -248,18 +248,35 @@ def build_refer(
     target_host: str, target_port: int, local_host: str, local_port: int,
     from_user: str, to_user: str, from_tag: str, to_tag: str, call_id: str,
     refer_to_user: str, transport: str = "udp", cseq_number: int = 2,
+    refer_to_host: str | None = None, refer_to_port: int | None = None,
 ) -> bytes:
     """RFC 3515: REFER within the dialog already established by a
     successfully-answered INVITE — reuses that dialog's Call-ID/
     From-tag/To-tag (a fresh branch, since REFER is its own
     transaction) and the next CSeq number in the dialog's sequence
     (the INVITE itself was CSeq 1). Refer-To names the transfer
-    target — see safe_transfer_probe's own docstring for why this is
-    always a synthetic, fictional extension in practice, never a
-    caller-supplied real destination."""
+    target — by default (refer_to_host=None) this is always a
+    synthetic, fictional extension ON THE TARGET ITSELF, never a
+    caller-supplied real destination (see safe_transfer_probe's own
+    docstring). refer_to_host/refer_to_port instead point Refer-To at
+    an address THIS TOOL is listening on, used only by
+    safe_transfer_probe's optional --confirm-transfer-reachable mode
+    (core/transfer_confirm.py) to observe a real callback rather than
+    inferring acceptance from signalling alone."""
     to_uri = f"sip:{to_user}@{target_host}"
     branch = _gen_branch()
-    refer_to_uri = f"sip:{refer_to_user}@{target_host}"
+    refer_to_host_used = refer_to_host or target_host
+    if refer_to_port:
+        refer_to_uri = f"sip:{refer_to_user}@{refer_to_host_used}:{refer_to_port}"
+    else:
+        refer_to_uri = f"sip:{refer_to_user}@{refer_to_host_used}"
+    if refer_to_host and transport != "udp":
+        # Hints the target to dial the callback back on the SAME
+        # transport this REFER itself arrived over -- standard SIP URI
+        # transport parameter usage (RFC 3261 §19.1.1), only meaningful
+        # when Refer-To points somewhere other than the target's own
+        # default listener.
+        refer_to_uri += f";transport={transport}"
     lines = [
         f"REFER {to_uri} SIP/2.0",
         f"Via: SIP/2.0/{transport.upper()} {local_host}:{local_port};branch={branch}",
@@ -674,15 +691,22 @@ class TransferProbeResult:
     notify_received: bool = False
     notify_sipfrag: str | None = None
     bye_sent: bool = False
+    # Only ever populated when callback_host was given (--confirm-
+    # transfer-reachable) -- direct, observed evidence rather than
+    # inferred from signalling. See core/transfer_confirm.py.
+    callback_confirmed: bool = False
+    callback_from: str | None = None
+    callback_user_agent: str | None = None
 
     @property
     def refer_appears_honored(self) -> bool:
         """True if the target's own signalling indicates the REFER was
         accepted and, per any NOTIFY received, at least attempted --
-        the real, actionable signal this probe exists to produce,
-        independent of whether the resulting transfer itself actually
-        succeeded (this probe has no way to observe that, and
-        Refer-To is a synthetic extension regardless — see this
+        the real, actionable signal this probe exists to produce when
+        no callback confirmation was requested, independent of whether
+        the resulting transfer itself actually succeeded (this probe
+        has no way to observe that without callback_confirmed, and
+        Refer-To is a synthetic extension by default — see this
         module's own docstring)."""
         if self.refer_final_status_code is not None and 200 <= self.refer_final_status_code < 300:
             return True
@@ -702,6 +726,8 @@ def safe_transfer_probe(
     connect_timeout: float = 3.0,
     tls_verify: bool = True,
     refer_wait_timeout: float = DEFAULT_REFER_WAIT_TIMEOUT,
+    callback_host: str | None = None,
+    callback_port: int = 0,
 ) -> TransferProbeResult:
     """Tests whether the target honors an in-dialog REFER (RFC 3515
     call transfer) from an unauthenticated caller — the toll-fraud-via-
@@ -743,13 +769,23 @@ def safe_transfer_probe(
     all — the same CANCEL-on-routing-indicating-response reflex from
     safe_invite_probe applies identically for that case, and the
     result simply reports dialog_established=False, refer_sent=False.
-    """
+
+    callback_host (None by default) switches Refer-To from the
+    synthetic-extension default to core/transfer_confirm.py's
+    TransferCallbackListener, bound at callback_host:callback_port —
+    an address THIS TOOL is listening on, so a real callback INVITE
+    from the target (if the REFER is actually honored, not just
+    acknowledged) can be directly observed rather than inferred from
+    signalling alone. See that module's own docstring for the full
+    reasoning and why this is, if anything, a SAFER variant than the
+    default rather than a riskier one."""
     branch = _gen_branch()
     from_tag = _gen_tag()
     call_id = _gen_call_id(local_host if local_host != "0.0.0.0" else "voipaudit")
 
     result = TransferProbeResult()
     to_tag: str | None = None
+    callback_listener = None
     try:
         conn = _open_transport(
             transport, target_host, target_port, local_port, connect_timeout, tls_verify=tls_verify,
@@ -832,11 +868,35 @@ def safe_transfer_probe(
         except OSError:
             return result  # can't even ACK -- nothing more to safely attempt
 
+        refer_to_user = REFER_TRANSFER_TEST_EXTENSION
+        refer_to_host = None
+        refer_to_port = None
+        if callback_host is not None:
+            from voipaudit.core.transfer_confirm import (
+                TransferCallbackListener,
+                generate_callback_token,
+            )
+
+            refer_to_user = generate_callback_token()
+            callback_listener = TransferCallbackListener(
+                callback_host, callback_port, transport, refer_to_user, timeout=refer_wait_timeout,
+            )
+            refer_to_host = callback_listener.host
+            refer_to_port = callback_listener.port
+
         refer = build_refer(
             target_host, target_port, local_host, conn.local_port,
             from_user, to_user, from_tag, to_tag, call_id,
-            refer_to_user=REFER_TRANSFER_TEST_EXTENSION, transport=transport, cseq_number=2,
+            refer_to_user=refer_to_user, transport=transport, cseq_number=2,
+            refer_to_host=refer_to_host, refer_to_port=refer_to_port,
         )
+        if callback_listener is not None:
+            # Started as close as possible to actually sending the
+            # REFER, not any earlier -- every second counted against
+            # refer_wait_timeout should be time the target could
+            # plausibly be reacting to the REFER, not time spent
+            # earlier in the INVITE/ACK exchange.
+            callback_listener.__enter__()
         try:
             conn.send(refer)
             result.refer_sent = True
@@ -870,6 +930,15 @@ def safe_transfer_probe(
 
         return result
     finally:
+        if callback_listener is not None:
+            # __exit__ joins the listener's background thread (bounded
+            # by its own timeout, already elapsed or nearly so by this
+            # point since it runs for the same refer_wait_timeout
+            # window) before its result is read.
+            callback_listener.__exit__(None, None, None)
+            result.callback_confirmed = callback_listener.result.received
+            result.callback_from = callback_listener.result.from_header
+            result.callback_user_agent = callback_listener.result.user_agent
         if result.dialog_established and to_tag:
             bye = build_bye(
                 target_host, target_port, local_host, conn.local_port,

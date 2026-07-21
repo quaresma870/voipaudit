@@ -295,12 +295,15 @@ class MockInviteResponder:
             self._send_response(180, "Ringing", headers, sender, to_tag="mockring")
         elif behavior == "trying_then_silence":
             self._send_response(100, "Trying", headers, sender)
-        elif behavior in ("answer", "answer_then_refer_accepted", "answer_then_refer_rejected"):
-            # The latter two behave identically to a plain "answer" for
-            # the INVITE leg itself -- their REFER-specific handling is
-            # in _run_refer_behavior below, dispatched separately once
-            # a REFER actually arrives within the dialog this answer
-            # establishes.
+        elif behavior in (
+            "answer", "answer_then_refer_accepted", "answer_then_refer_rejected",
+            "answer_then_honor_transfer",
+        ):
+            # All three REFER-related behaviors behave identically to a
+            # plain "answer" for the INVITE leg itself -- their
+            # REFER-specific handling is in _run_refer_behavior below,
+            # dispatched separately once a REFER actually arrives within
+            # the dialog this answer establishes.
             self._send_response(200, "OK", headers, sender, to_tag="mockans")
         elif behavior == "reject_self_spoofed_identity":
             # Identity-aware, mirroring the offer-aware SRTP pattern:
@@ -401,6 +404,15 @@ class MockInviteResponder:
             self._send_refer_notify(req_headers, sender)
         elif behavior == "answer_then_refer_rejected":
             self._send_response(403, "Forbidden", req_headers, sender)
+        elif behavior == "answer_then_honor_transfer":
+            # Actually places a new, real INVITE toward whatever
+            # Refer-To names -- used to test safe_transfer_probe's
+            # --confirm-transfer-reachable mode end to end (a real
+            # observed callback, not just a 202/NOTIFY at the
+            # signalling level). A real target that genuinely honors
+            # transfers behaves exactly this way.
+            self._send_response(202, "Accepted", req_headers, sender)
+            self._place_callback_invite(req_headers)
         # else: no REFER-specific behavior defined for this destination
         # -- no response at all, a safe no-op default matching every
         # other unrecognized-behavior case in this fixture.
@@ -435,6 +447,63 @@ class MockInviteResponder:
         ]
         try:
             sender("\r\n".join(lines).encode() + b"\r\n" + body_bytes)
+        except OSError:
+            pass
+
+    @staticmethod
+    def _place_callback_invite(req_headers: dict[str, str]) -> None:
+        """Parses Refer-To and places a REAL new INVITE there, over
+        whatever transport it names (defaulting to UDP if none is
+        given, matching build_refer's own default) -- a real target
+        that genuinely honors a transfer does exactly this on its own
+        outbound leg, which this tool has no dialog with. Best-effort:
+        any failure to reach Refer-To (e.g. a genuinely nonexistent
+        synthetic test extension) is silently swallowed, matching this
+        whole fixture's "a real PBX doesn't crash over this" ethos."""
+        refer_to = req_headers.get("refer-to", "").strip()
+        if refer_to.startswith("<") and refer_to.endswith(">"):
+            refer_to = refer_to[1:-1]
+        m = re.match(r"sip:([^@]+)@([^:;]+)(?::(\d+))?(?:;transport=(\w+))?", refer_to)
+        if not m:
+            return
+        user, host, port_str, transport = m.groups()
+        port = int(port_str) if port_str else 5060
+        transport = (transport or "udp").lower()
+
+        call_id = f"mockcallback-{secrets.token_hex(6)}@mockpbx"
+        branch = "z9hG4bK" + secrets.token_hex(8)
+        invite = (
+            f"INVITE sip:{user}@{host}:{port} SIP/2.0\r\n"
+            f"Via: SIP/2.0/{transport.upper()} {host}:9999;branch={branch}\r\n"
+            f"From: <sip:mockpbx-transfer@{host}>;tag={secrets.token_hex(8)}\r\n"
+            f"To: <sip:{user}@{host}>\r\n"
+            f"Call-ID: {call_id}\r\n"
+            "CSeq: 1 INVITE\r\n"
+            f"Contact: <sip:mockpbx-transfer@{host}:9999>\r\n"
+            "User-Agent: MockPBX-Transfer/1.0\r\n"
+            "Content-Length: 0\r\n\r\n"
+        ).encode()
+
+        try:
+            if transport == "udp":
+                sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                try:
+                    sock.sendto(invite, (host, port))
+                finally:
+                    sock.close()
+            else:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.settimeout(2.0)
+                try:
+                    sock.connect((host, port))
+                    if transport == "tls":
+                        ctx = ssl.create_default_context()
+                        ctx.check_hostname = False
+                        ctx.verify_mode = ssl.CERT_NONE
+                        sock = ctx.wrap_socket(sock, server_hostname=host)
+                    sock.sendall(invite)
+                finally:
+                    sock.close()
         except OSError:
             pass
 

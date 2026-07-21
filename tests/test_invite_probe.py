@@ -580,6 +580,78 @@ class TestSafeTransferProbe:
             server.stop()
 
 
+class TestSafeTransferProbeCallbackConfirmation:
+    """Tests safe_transfer_probe's callback_host/callback_port mode
+    against the mock invite responder's answer_then_honor_transfer
+    behavior, which -- unlike answer_then_refer_accepted -- actually
+    places a real new INVITE toward whatever Refer-To names, exactly
+    like a real target that genuinely honors transfers would."""
+
+    def test_callback_confirmed_when_target_actually_honors_transfer(self):
+        server = start_mock_invite_responder(destination_behaviors={"honor1": "answer_then_honor_transfer"})
+        try:
+            result = safe_transfer_probe(
+                "127.0.0.1", server.port, "honor1", total_timeout=3.0, refer_wait_timeout=2.0,
+                callback_host="127.0.0.1", callback_port=0,
+            )
+            assert result.callback_confirmed is True
+            assert "mockpbx-transfer" in (result.callback_from or "")
+            assert result.callback_user_agent == "MockPBX-Transfer/1.0"
+            assert result.bye_sent is True
+        finally:
+            server.stop()
+
+    def test_callback_not_confirmed_when_refer_only_acknowledged(self):
+        """The existing answer_then_refer_accepted behavior sends a
+        202 + NOTIFY but never actually places a real callback call --
+        confirms callback_confirmed stays False even though
+        refer_appears_honored (the signalling-only signal) is True,
+        proving the two are genuinely independent checks."""
+        server = start_mock_invite_responder(destination_behaviors={"accept1": "answer_then_refer_accepted"})
+        try:
+            result = safe_transfer_probe(
+                "127.0.0.1", server.port, "accept1", total_timeout=3.0, refer_wait_timeout=1.5,
+                callback_host="127.0.0.1", callback_port=0,
+            )
+            assert result.refer_appears_honored is True
+            assert result.callback_confirmed is False
+        finally:
+            server.stop()
+
+    def test_callback_not_confirmed_when_transfer_rejected(self):
+        server = start_mock_invite_responder(destination_behaviors={"reject_refer1": "answer_then_refer_rejected"})
+        try:
+            result = safe_transfer_probe(
+                "127.0.0.1", server.port, "reject_refer1", total_timeout=3.0, refer_wait_timeout=1.0,
+                callback_host="127.0.0.1", callback_port=0,
+            )
+            assert result.callback_confirmed is False
+        finally:
+            server.stop()
+
+    def test_callback_confirmed_over_tcp(self):
+        server = start_mock_invite_responder(destination_behaviors={"honor1": "answer_then_honor_transfer"})
+        try:
+            result = safe_transfer_probe(
+                "127.0.0.1", server.tcp_port, "honor1", total_timeout=3.0, refer_wait_timeout=2.0,
+                transport="tcp", callback_host="127.0.0.1", callback_port=0,
+            )
+            assert result.callback_confirmed is True
+        finally:
+            server.stop()
+
+    def test_callback_confirmed_over_tls(self):
+        server = start_mock_invite_responder(destination_behaviors={"honor1": "answer_then_honor_transfer"})
+        try:
+            result = safe_transfer_probe(
+                "127.0.0.1", server.tls_port, "honor1", total_timeout=3.0, refer_wait_timeout=2.0,
+                transport="tls", tls_verify=False, callback_host="127.0.0.1", callback_port=0,
+            )
+            assert result.callback_confirmed is True
+        finally:
+            server.stop()
+
+
 class TestTollFraudExposurePlugin:
     def _engagement(self, tmp_path) -> Engagement:
         path = tmp_path / "authorization.yml"
