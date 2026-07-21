@@ -51,7 +51,7 @@ jobs:
       - name: Install built wheel in a clean venv
         run: |
           python -m venv /tmp/smoke-venv
-          /tmp/smoke-venv/bin/pip install "$(echo dist/*.whl)"
+          /tmp/smoke-venv/bin/pip install "$(echo dist/*.whl)[pcap]"
           /tmp/smoke-venv/bin/voipaudit --version
           /tmp/smoke-venv/bin/voipaudit --help
 
@@ -197,6 +197,48 @@ jobs:
           echo "$OUTPUT" | grep -q "high-risk destination" || (echo "expected high-risk-destination finding not found" && exit 1)
           echo "$OUTPUT" | grep -q "Off-hours" || (echo "expected off-hours finding not found" && exit 1)
           echo "$OUTPUT" | grep -q "burst" || (echo "expected burst finding not found" && exit 1)
+          echo "::endgroup::"
+
+          echo "::group::analyze-pcap — real SIP call reconstruction from a real synthetic pcap"
+          # Uses --json rather than grepping the terminal table: applying
+          # the lesson learned in the sibling camara-audit repo's own CI
+          # debugging (Rich word-wraps long finding titles across
+          # multiple lines depending on terminal width, which differs
+          # between an interactive session and CI's piped output) from
+          # the start here, not rediscovering it.
+          /tmp/smoke-venv/bin/python3 -c "
+          import sys, time
+          sys.path.insert(0, '$GITHUB_WORKSPACE')
+          from scapy.all import IP, UDP, Ether, wrpcap
+          base = time.time()
+          call_id = 'ci-call@test'
+          invite = (
+              f'INVITE sip:252611111111@192.168.1.20 SIP/2.0\r\nFrom: <sip:2003@192.168.1.10>;tag=a1\r\n'
+              f'To: <sip:252611111111@192.168.1.20>\r\nCall-ID: {call_id}\r\nCSeq: 1 INVITE\r\nContent-Length: 0\r\n\r\n'
+          )
+          ok = (
+              f'SIP/2.0 200 OK\r\nFrom: <sip:2003@192.168.1.10>;tag=a1\r\n'
+              f'To: <sip:252611111111@192.168.1.20>;tag=b1\r\nCall-ID: {call_id}\r\nCSeq: 1 INVITE\r\nContent-Length: 0\r\n\r\n'
+          )
+          def pkt(payload, t_offset, src, dst):
+              p = Ether()/IP(src=src, dst=dst)/UDP(sport=5060, dport=5060)/payload.encode()
+              p.time = base + t_offset
+              return p
+          packets = [
+              pkt(invite, 0.0, '192.168.1.10', '192.168.1.20'),
+              pkt(ok, 3.0, '192.168.1.20', '192.168.1.10'),
+          ]
+          wrpcap('/tmp/ci_test.pcap', packets)
+          print('Real synthetic pcap written: /tmp/ci_test.pcap')
+          "
+          $VA analyze-pcap /tmp/ci_test.pcap --json /tmp/pcap_findings.json || true
+          cat /tmp/pcap_findings.json
+          python3 -c "
+          import json
+          findings = json.load(open('/tmp/pcap_findings.json'))
+          assert any(f['severity'] == 'CRITICAL' and '+252' in f['title'] for f in findings), f'expected +252 high-risk-destination finding not found: {findings}'
+          print(f'OK: {len(findings)} finding(s), including the expected high-risk destination CRITICAL')
+          "
           echo "::endgroup::"
 
           kill $MOCK_PID 2>/dev/null || true

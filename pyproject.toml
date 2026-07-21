@@ -11,6 +11,7 @@ dependencies = ["click>=8.1.0", "rich>=13.7.0", "pyyaml>=6.0.1", "cryptography>=
 
 [project.optional-dependencies]
 dashboard = ["fastapi>=0.110.0", "uvicorn>=0.29.0"]
+pcap = ["scapy>=2.5.0"]
 
 [project.scripts]
 voipaudit = "voipaudit.cli:main"
