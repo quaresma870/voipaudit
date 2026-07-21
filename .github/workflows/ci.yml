@@ -312,5 +312,41 @@ jobs:
           kill $INVITE_MOCK_PID 2>/dev/null || true
           echo "::endgroup::"
 
+          echo "::group::scan — invite-tier (srtp_check), real differential SRTP test against a real mock responder"
+          # A separate mock instance configured with the offer-aware
+          # 'srtp_only_pbx' behavior -- rejects an SRTP-only offer but
+          # answers a plain-RTP offer normally, so this genuinely
+          # exercises the differential logic (not just "SRTP always
+          # works" or "nothing routes").
+          /tmp/smoke-venv/bin/python3 -c "
+          import sys, time
+          sys.path.insert(0, '$GITHUB_WORKSPACE')
+          from tests.fixtures.mock_pbx.invite_responder import start_mock_invite_responder
+          server = start_mock_invite_responder(destination_behaviors={'voipaudit-srtp-test': 'srtp_only_pbx'})
+          with open('/tmp/srtp_mock_port.txt', 'w') as f:
+              f.write(str(server.port))
+          time.sleep(30)
+          " > /tmp/srtp_mock.log 2>&1 &
+          SRTP_MOCK_PID=$!
+          for i in $(seq 1 20); do
+            if [ -f /tmp/srtp_mock_port.txt ]; then break; fi
+            sleep 0.5
+          done
+          SRTP_PORT=$(cat /tmp/srtp_mock_port.txt)
+          echo "Mock SRTP-aware responder on port $SRTP_PORT"
+
+          $VA scan "127.0.0.1:$SRTP_PORT" --modules srtp_check --confirm ci-invite-test \
+            -a invite_authorization.yml --json /tmp/srtp_findings.json || true
+          cat /tmp/srtp_findings.json
+          python3 -c "
+          import json
+          findings = json.load(open('/tmp/srtp_findings.json'))
+          assert any(f['severity'] == 'MEDIUM' and 'not supported' in f['title'].lower() for f in findings), f'expected a MEDIUM SRTP-not-supported finding not found: {findings}'
+          print(f'OK: {len(findings)} finding(s), including the expected differential MEDIUM finding')
+          "
+
+          kill $SRTP_MOCK_PID 2>/dev/null || true
+          echo "::endgroup::"
+
           kill $MOCK_PID 2>/dev/null || true
           echo "All integration checks passed."
