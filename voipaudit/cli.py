@@ -128,13 +128,22 @@ def list_plugins():
               help="Port to probe for TLS/SIPS — used only by transport_security.")
 @click.option("--plaintext-port", default=5060, show_default=True, type=int,
               help="Port to probe for plaintext UDP/TCP — used only by transport_security.")
-def scan(targets, authorization, audit_log, modules, confirm, timeout, transport, insecure, tls_port, plaintext_port):
+@click.option("--json", "json_output", default=None, type=click.Path(),
+              help="Also write findings as JSON to this path — a more robust way to check "
+                   "results programmatically than parsing the terminal table's word-wrapped text.")
+def scan(targets, authorization, audit_log, modules, confirm, timeout, transport, insecure, tls_port, plaintext_port, json_output):
     """Scan one or more SIP targets (host, host:port, or sip:/sips: URI)."""
     from voipaudit.core.authorization import AuthorizationError, load_authorization
-    from voipaudit.core.engagement import ActiveTierNotConfirmed, Engagement, ScopeViolation
+    from voipaudit.core.engagement import (
+        ActiveTierNotConfirmed,
+        Engagement,
+        InviteTierNotConfirmed,
+        ScopeViolation,
+    )
     from voipaudit.plugins import available_plugins
     from voipaudit.plugins.pbx_fingerprint import PBXFingerprintModule
     from voipaudit.plugins.register_exposed import RegisterExposedModule
+    from voipaudit.plugins.toll_fraud_exposure import TollFraudExposureModule
     from voipaudit.plugins.transport_security import TransportSecurityModule
     from voipaudit.reports.terminal import print_results
 
@@ -142,6 +151,7 @@ def scan(targets, authorization, audit_log, modules, confirm, timeout, transport
         "pbx_fingerprint": PBXFingerprintModule,
         "register_exposed": RegisterExposedModule,
         "transport_security": TransportSecurityModule,
+        "toll_fraud_exposure": TollFraudExposureModule,
     }
 
     try:
@@ -164,10 +174,11 @@ def scan(targets, authorization, audit_log, modules, confirm, timeout, transport
     else:
         selected = [m for m, cat in registry.items() if cat == "recon"]
 
-    if any(registry[m] == "active" for m in selected):
+    if any(registry[m] in ("active", "invite") for m in selected):
         if not confirm:
             console.print(
-                "[red]✘ At least one selected module is active-tier and --confirm was not given.[/red]"
+                "[red]✘ At least one selected module is active-tier (or higher) and --confirm "
+                "was not given.[/red]"
             )
             console.print(f"  Re-run with: [cyan]--confirm {auth.engagement_id}[/cyan]")
             sys.exit(1)
@@ -178,20 +189,50 @@ def scan(targets, authorization, audit_log, modules, confirm, timeout, transport
             console.print(f"[red]✘ {exc}[/red]")
             sys.exit(1)
 
+    if any(registry[m] == "invite" for m in selected):
+        console.print(
+            "\n[bold yellow]⚠ invite-tier module(s) selected — this sends real SIP INVITE "
+            "requests.[/bold yellow]"
+        )
+        console.print(
+            "  A real INVITE can ring a phone or, if answered, start accruing real "
+            "telephony cost.\n  This probe auto-cancels at the earliest possible moment "
+            "(see core/invite_probe.py), but is never risk-free.\n"
+        )
+        if not confirm:
+            console.print(
+                "[red]✘ At least one selected module is invite-tier and --confirm was not given.[/red]"
+            )
+            console.print(f"  Re-run with: [cyan]--confirm {auth.engagement_id}[/cyan]")
+            sys.exit(1)
+        try:
+            eng.confirm_invite_tier(confirm)
+            console.print(f"[green]✔[/green] Invite-tier confirmed for engagement '{auth.engagement_id}'.\n")
+        except InviteTierNotConfirmed as exc:
+            console.print(f"[red]✘ {exc}[/red]")
+            sys.exit(1)
+
     exit_code = 0
+    all_findings = []
     for target in targets:
         results = []
         for mod_name in selected:
             plugin_cls = _PLUGIN_CLASSES[mod_name]
-            # transport_security has a genuinely different shape (it
-            # always probes TLS + plaintext together, regardless of
-            # --transport) rather than forcing a one-size-fits-all
-            # constructor across plugins whose actual behavior differs.
+            # transport_security and toll_fraud_exposure each have a
+            # genuinely different constructor shape from the
+            # transport/tls_verify pattern the other plugins share —
+            # transport_security always probes TLS + plaintext
+            # together regardless of --transport, and
+            # toll_fraud_exposure sends INVITE over a fixed transport
+            # with its own max_destinations knob, not a tls_verify
+            # concept at all.
             if mod_name == "transport_security":
                 plugin = plugin_cls(
                     eng, timeout=timeout, tls_verify=not insecure,
                     tls_port=tls_port, plaintext_port=plaintext_port,
                 )
+            elif mod_name == "toll_fraud_exposure":
+                plugin = plugin_cls(eng, timeout=timeout, transport=transport)
             else:
                 plugin = plugin_cls(eng, timeout=timeout, transport=transport, tls_verify=not insecure)
             try:
@@ -201,9 +242,16 @@ def scan(targets, authorization, audit_log, modules, confirm, timeout, transport
                 exit_code = 1
                 continue
             results.append(result)
+            all_findings.extend(result.findings)
             if any(f.severity.value in ("CRITICAL", "HIGH") for f in result.findings):
                 exit_code = 1
         print_results(target, results)
+
+    if json_output:
+        import json as json_module
+        with open(json_output, "w") as f:
+            json_module.dump([f.to_dict() for f in all_findings], f, indent=2)
+        console.print(f"[green]✔[/green] Wrote {len(all_findings)} finding(s) to {json_output}")
 
     sys.exit(exit_code)
 

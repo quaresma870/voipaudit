@@ -26,6 +26,24 @@ class AuthorizationError(ValueError):
     """Raised when authorization.yml is missing, malformed, or invalid."""
 
 
+# The exact, required literal text for authorization.yml's
+# invite_tier_acknowledgment field, when 'invite' is among the
+# authorized categories. Deliberately not user-paraphrasable — the
+# whole point is that copying this exact sentence into their own file
+# is itself a deliberate, legible act of acknowledgment, not a
+# checkbox that can be ticked without reading it. A real INVITE (even
+# one cancelled within a second or two) can ring a phone or, in the
+# worst case, be answered and start accruing real per-minute cost —
+# materially different from every other probe this toolkit sends,
+# which is why this sits above the existing 'active' tier rather than
+# folding into it.
+REQUIRED_INVITE_ACKNOWLEDGMENT = (
+    "I understand that invite-tier tests send real SIP INVITE requests "
+    "that may ring phones or incur real telephony cost, and I am "
+    "authorized to do this against every target in scope."
+)
+
+
 @dataclass
 class Scope:
     targets: list[str]
@@ -59,6 +77,7 @@ class Authorization:
     window: Window
     confirmation_phrase: str
     rate_limits: RateLimits | None = None
+    invite_tier_acknowledgment: str | None = None
     source_path: Path | None = None
 
     def is_within_window(self, now: datetime | None = None) -> bool:
@@ -184,6 +203,20 @@ def load_authorization(path: str | Path) -> Authorization:
         allowed_categories=list(scope_data.get("allowed_categories") or []),
     )
 
+    invite_tier_acknowledgment = data.get("invite_tier_acknowledgment")
+    if "invite" in scope.allowed_categories:
+        if not invite_tier_acknowledgment:
+            raise AuthorizationError(
+                "'invite' is in scope.allowed_categories, so 'invite_tier_acknowledgment' is "
+                "required — it must contain this exact text, copied verbatim, acknowledging "
+                f"you understand what invite-tier testing does:\n\n{REQUIRED_INVITE_ACKNOWLEDGMENT}"
+            )
+        if str(invite_tier_acknowledgment).strip() != REQUIRED_INVITE_ACKNOWLEDGMENT:
+            raise AuthorizationError(
+                "'invite_tier_acknowledgment' does not exactly match the required text. It "
+                f"must be copied verbatim, not paraphrased:\n\n{REQUIRED_INVITE_ACKNOWLEDGMENT}"
+            )
+
     rate_limits = None
     rate_data = data.get("rate_limits")
     if rate_data:
@@ -208,6 +241,7 @@ def load_authorization(path: str | Path) -> Authorization:
         window=Window(start=start, end=end),
         confirmation_phrase=str(data["confirmation_phrase"]),
         rate_limits=rate_limits,
+        invite_tier_acknowledgment=str(invite_tier_acknowledgment) if invite_tier_acknowledgment else None,
         source_path=path,
     )
 

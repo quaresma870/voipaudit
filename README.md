@@ -23,8 +23,8 @@ exposure, service disruption, legal liability).
 
 ## Status
 
-Early, actively developed. v0.1 covers three live-scan plugins (UDP,
-TCP, and TLS) plus a file-analysis command:
+Early, actively developed. v0.1 covers four live-scan plugins (UDP,
+TCP, and TLS) plus file-analysis commands:
 
 - **`pbx_fingerprint`** (recon tier) — sends a SIP OPTIONS ping (RFC 3261
   §11, no dialog created, no side effects) and identifies the PBX/SIP
@@ -36,6 +36,12 @@ TCP, and TLS) plus a file-analysis command:
   offered, reports certificate expiry, and flags plaintext SIP still
   being accepted alongside TLS (meaning encryption isn't actually
   *enforced*, just available).
+- **`toll_fraud_exposure`** (**invite tier**, requires a written
+  acknowledgment in `authorization.yml` *and* `--confirm` twice — see
+  [Invite-tier: real INVITE probing](#invite-tier-real-invite-probing)
+  below) — sends real, safety-bounded SIP INVITEs toward known
+  high-risk destinations to check whether the dialplan would even route
+  a call there, auto-cancelling at the earliest possible moment.
 - **`analyze-cdr`** — parses an Asterisk CDR CSV export and flags
   patterns indicative of toll fraud already having occurred: calls to
   known high-risk international destinations, off-hours call bursts, and
@@ -97,6 +103,7 @@ to the standard SIP UDP port 5060 (RFC 3261 §18.1) when omitted. Add
 | `pbx_fingerprint` | recon | Identifies the PBX/SIP stack via a SIP OPTIONS ping |
 | `register_exposed` | active | Detects unauthenticated REGISTER acceptance |
 | `transport_security` | recon | TLS availability, certificate expiry, plaintext-alongside-TLS |
+| `toll_fraud_exposure` | **invite** | Whether the dialplan routes calls toward high-risk destinations |
 
 ```bash
 voipaudit list-plugins
@@ -106,6 +113,47 @@ voipaudit list-plugins
 voipaudit scan pbx.example.com --modules transport_security \
   --tls-port 5061 --plaintext-port 5060 --insecure
 ```
+
+## Invite-tier: real INVITE probing
+
+`toll_fraud_exposure` sends real SIP INVITE requests — categorically
+different from every other probe in this toolkit. A real INVITE can
+ring a phone, or in the worst case be answered and start accruing real
+per-minute cost. This is why invite-tier sits **above** active-tier
+with its own, stricter authorization requirements, rather than being
+folded into `active`:
+
+1. **A written acknowledgment in `authorization.yml`.** `invite` in
+   `scope.allowed_categories` requires a new field,
+   `invite_tier_acknowledgment`, containing this exact text copied
+   verbatim (not paraphrased — `voipaudit init` doesn't pre-fill it for
+   you):
+   ```
+   I understand that invite-tier tests send real SIP INVITE requests
+   that may ring phones or incur real telephony cost, and I am
+   authorized to do this against every target in scope.
+   ```
+2. **`active` must also be in `allowed_categories`.** Invite-tier is an
+   escalation beyond active-tier, not an independent switch —
+   `active` must be confirmed first, every session.
+3. **`--confirm <engagement_id>` still required**, same as active-tier.
+
+```bash
+voipaudit scan pbx.example.com --modules toll_fraud_exposure --confirm <engagement_id>
+```
+
+**The safety technique:** as soon as ANY response indicates the call is
+actually being routed (180 Ringing, 183 Session Progress, or an
+outright 2xx answer), the probe immediately sends CANCEL (or, for the
+rare instant-answer case, ACK followed immediately by BYE) — see
+`core/invite_probe.py`'s own docstring for the full design. The goal is
+only ever "does the dialplan route this destination at all," never
+"does the call complete." A hard timeout (default 4s) applies
+throughout, and a mandatory 2-second pause separates each destination
+tested, up to a fixed cap of 5 destinations per run. Test destinations
+are drawn from the same `HIGH_RISK_PREFIXES` list `analyze-cdr`/
+`analyze-pcap` already use — see their own documentation above for
+sourcing and the same non-exhaustiveness caveat.
 
 ## CDR / toll-fraud analysis
 
@@ -171,12 +219,13 @@ voipaudit/
 ├── voipaudit/
 │   ├── cli.py                    # init, validate-scope, scan, list-plugins, analyze-cdr, analyze-pcap
 │   ├── core/
-│   │   ├── authorization.py      # Authorization/Scope/Window — the scope gate's data model
-│   │   ├── engagement.py         # Engagement — ties Authorization + audit log together
+│   │   ├── authorization.py      # Authorization/Scope/Window — the scope gate's data model + REQUIRED_INVITE_ACKNOWLEDGMENT
+│   │   ├── engagement.py         # Engagement — ties Authorization + audit log together, 3-tier confirmation
 │   │   ├── audit_log.py          # hash-chained, append-only audit log
 │   │   ├── rate_limit.py         # conservative SIP-specific rate budget defaults
 │   │   ├── sip.py                # raw SIP (RFC 3261) message construction/parsing/transport
 │   │   ├── sip_message.py        # general SIP message parsing (requests + responses) for captured traffic
+│   │   ├── invite_probe.py       # real INVITE probing with immediate cancel/ack-bye — the safety-critical core
 │   │   ├── cdr.py                # Asterisk CDR CSV parsing
 │   │   ├── pcap_parser.py        # pcap → SIP call session reconstruction → CDRRecord
 │   │   └── models.py             # Finding, Severity, ModuleResult
@@ -184,17 +233,20 @@ voipaudit/
 │   │   ├── base.py               # BasePlugin — every plugin's scan() must call authorize_action()
 │   │   ├── pbx_fingerprint.py
 │   │   ├── register_exposed.py
-│   │   └── transport_security.py
+│   │   ├── transport_security.py
+│   │   └── toll_fraud_exposure.py    # invite tier — live dialplan-routing exposure check
 │   ├── analyzers/
 │   │   └── toll_fraud.py         # CDR-based toll-fraud pattern detection (no Engagement gate — file-only)
 │   └── reports/
 │       └── terminal.py           # Rich-based terminal output
 ├── tests/
-│   ├── fixtures/mock_pbx/server.py   # a real UDP+TCP+TLS SIP server, for tests only
+│   ├── fixtures/mock_pbx/server.py            # a real UDP+TCP+TLS SIP server, for tests only
+│   ├── fixtures/mock_pbx/invite_responder.py  # a real, configurable-behavior INVITE responder, for tests only
 │   ├── fixtures/cdr/sample_master.csv
 │   ├── test_voipaudit.py
 │   ├── test_toll_fraud.py
-│   └── test_pcap_analysis.py     # pcap files generated programmatically via scapy within the tests
+│   ├── test_pcap_analysis.py     # pcap files generated programmatically via scapy within the tests
+│   └── test_invite_probe.py      # the invite-tier safety infrastructure — tested most thoroughly of all
 └── .github/workflows/ci.yml
 ```
 
