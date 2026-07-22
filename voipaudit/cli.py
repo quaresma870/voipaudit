@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sys
+from datetime import UTC, datetime
 from pathlib import Path
 
 import click
@@ -158,10 +159,14 @@ def list_plugins():
 @click.option("--callback-port", default=0, show_default=True, type=int,
               help="refer_transfer_abuse --confirm-transfer-reachable only: port for the confirmation "
                    "listener. Defaults to an OS-assigned ephemeral port.")
+@click.option("--db", "db_path", default=None, type=click.Path(),
+              help="Also persist each target's run and findings to this SQLite database (created if "
+                   "it doesn't exist) — browsable later with `voipaudit dashboard --db PATH`. Opt-in; "
+                   "without this, nothing is written beyond the existing tamper-evident audit log.")
 def scan(
     targets, authorization, audit_log, modules, confirm, timeout, transport, insecure, tls_port,
     plaintext_port, json_output, to_user, spoof_from, confirm_transfer_reachable, callback_host,
-    callback_port,
+    callback_port, db_path,
 ):
     """Scan one or more SIP targets (host, host:port, or sip:/sips: URI)."""
     from voipaudit.core.authorization import AuthorizationError, load_authorization
@@ -249,10 +254,16 @@ def scan(
             console.print(f"[red]✘ {exc}[/red]")
             sys.exit(1)
 
+    db_conn = None
+    if db_path:
+        from voipaudit.core.db import init_db
+        db_conn = init_db(db_path)
+
     exit_code = 0
     all_findings = []
     for target in targets:
         results = []
+        run_started_at = datetime.now(UTC)
         for mod_name in selected:
             plugin_cls = _PLUGIN_CLASSES[mod_name]
             # transport_security has a genuinely different shape from
@@ -293,6 +304,19 @@ def scan(
             if any(f.severity.value in ("CRITICAL", "HIGH") for f in result.findings):
                 exit_code = 1
         print_results(target, results)
+
+        if db_conn is not None:
+            from voipaudit.core.db import record_run
+            target_findings = [f for r in results for f in r.findings]
+            record_run(
+                db_conn, engagement_id=auth.engagement_id, client=auth.client, target=target,
+                modules=selected, transport=transport, started_at=run_started_at,
+                finished_at=datetime.now(UTC), findings=target_findings,
+            )
+
+    if db_conn is not None:
+        db_conn.close()
+        console.print(f"[green]✔[/green] Persisted scan history to {db_path}")
 
     if json_output:
         import json as json_module
@@ -414,6 +438,41 @@ def analyze_pcap(pcap_file, business_start_hour, business_end_hour, tls_keylog, 
 
     if any(f.severity.value in ("CRITICAL", "HIGH") for f in result.findings):
         sys.exit(1)
+
+
+@cli.command()
+@click.option("--db", "db_path", required=True, type=click.Path(exists=True),
+              help="Path to a scan history database populated by `scan --db`.")
+@click.option("--host", default="127.0.0.1", show_default=True,
+              help="Bind address. Defaults to localhost only — this dashboard has no "
+                   "authentication of its own; only bind it more broadly on a trusted network.")
+@click.option("--port", default=8000, show_default=True, type=int)
+def dashboard(db_path, host, port):
+    """Read-only web dashboard for browsing `scan --db` history.
+
+    GET-only: nothing served here ever inserts, updates, or deletes
+    anything. Requires the optional 'dashboard' extra: pip install
+    voipaudit[dashboard].
+    """
+    try:
+        import uvicorn
+    except ImportError:
+        console.print(
+            "[red]✘ The 'dashboard' extra is required.[/red] Install with: "
+            "pip install voipaudit[dashboard]"
+        )
+        sys.exit(1)
+
+    from voipaudit.dashboard.app import create_app
+
+    app = create_app(db_path)
+    console.print(f"[green]✔[/green] Serving read-only dashboard at http://{host}:{port} (Ctrl+C to stop)")
+    if host not in ("127.0.0.1", "localhost"):
+        console.print(
+            "[yellow]⚠ Binding beyond localhost — this dashboard has no authentication of its "
+            "own. Only do this on a trusted network.[/yellow]"
+        )
+    uvicorn.run(app, host=host, port=port, log_level="warning")
 
 
 def main():
