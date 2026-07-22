@@ -280,6 +280,41 @@ shift based on what turns out to matter most in practice.
   mock invite responder (`reject_self_spoofed_identity`,
   `answer_then_refer_accepted`/`answer_then_refer_rejected` behaviors).
 
+### v0.9.0
+- `refer_transfer_abuse --confirm-transfer-reachable`: closes the gap
+  the v0.8.0 entry above flagged — `refer_transfer_abuse`'s default
+  Refer-To (a synthetic extension on the target itself) can only prove
+  a REFER was *accepted*, not that a transfer toward an arbitrary,
+  externally-reachable destination actually *completes*. This flag
+  points Refer-To at a small, temporary SIP UAS this tool runs itself
+  (`core/transfer_confirm.py`'s `TransferCallbackListener`, over
+  UDP/TCP/TLS, matching whichever transport the REFER itself used —
+  TLS uses a fresh ephemeral self-signed certificate, generated per
+  run and never persisted) instead of the sibling receiving-UA
+  architecture originally sketched as a longer-term idea. If the
+  target genuinely honors the transfer, it places a real callback
+  INVITE this tool directly observes — correlated via a random token
+  in the user part, so unrelated traffic can't be mistaken for it —
+  and immediately declines (603) the instant it's confirmed, never
+  letting a confirmed callback actually ring or answer. This is, if
+  anything, SAFER than the existing default: nothing is ever dialed
+  toward a real, billable destination — the "transfer" just comes back
+  to infrastructure this tool already controls.
+- `--callback-host`/`--callback-port` override the address advertised
+  in Refer-To, which otherwise auto-detects the local outbound-routing
+  IP toward the target (the standard connect()-a-UDP-socket trick,
+  which consults the routing table without transmitting anything) —
+  necessary for NAT/firewalled engagements where that address isn't
+  what the target can actually reach back on.
+- New severity ladder for `refer_transfer_abuse`: CRITICAL when the
+  callback is directly confirmed (verified: stays at HIGH, not
+  CRITICAL, when a target only acknowledges the REFER via 202/NOTIFY
+  without ever placing the callback — confirmed against a real,
+  extended mock behavior that actually places the callback INVITE
+  itself, distinct from the existing accept-only-at-the-signalling-
+  level one), HIGH when only the signalling-level "appears honored"
+  evidence is available (confirm mode not requested), INFO otherwise.
+
 ## Next
 
 ### TLS 1.3 pcap decryption support
@@ -299,14 +334,3 @@ aren't recognized yet.
 A `--db` flag to persist scan results (matching the sibling
 secureaudit/redteam-toolkit/loganalyzer repos' own SQLite-backed history
 pattern) and a read-only web dashboard to browse past engagements.
-
-### Longer term: REFER-to-real-destination transfer confirmation
-`refer_transfer_abuse` deliberately only ever targets a synthetic,
-fictional extension (see v0.8.0 above for why) — it can prove a
-target's dialplan *accepts* an unauthenticated REFER, but not that a
-transfer toward a real, external, billable destination actually
-completes. Confirming that end-to-end would need a second, receiving
-UA this tool controls (to observe an actual incoming call from the
-transfer), a materially different architecture from every other
-single-sided probe in this module — worth real design thought before
-attempting, not a small extension of the current approach.

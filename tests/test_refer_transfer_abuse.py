@@ -64,6 +64,50 @@ class TestReferTransferAbusePlugin:
         finally:
             server.stop()
 
+    def test_confirmed_reachable_transfer_reports_critical(self, tmp_path):
+        """--confirm-transfer-reachable against a target that actually
+        honors the transfer (places a real callback INVITE) must
+        escalate to CRITICAL, the direct-proof outcome."""
+        from voipaudit.plugins.refer_transfer_abuse import ReferTransferAbuseModule
+
+        server = start_mock_invite_responder(destination_behaviors={
+            "voipaudit-transfer-test": "answer_then_honor_transfer",
+        })
+        try:
+            eng = self._engagement(tmp_path)
+            result = ReferTransferAbuseModule(
+                eng, timeout=3.0, refer_wait_timeout=2.0,
+                confirm_reachable=True, callback_host="127.0.0.1",
+            ).run(f"127.0.0.1:{server.port}")
+            assert result.error is None
+            assert len(result.findings) == 1
+            assert result.findings[0].severity.value == "CRITICAL"
+            assert "confirmed" in result.findings[0].title.lower()
+        finally:
+            server.stop()
+
+    def test_confirm_reachable_but_only_acknowledged_stays_high(self, tmp_path):
+        """--confirm-transfer-reachable against a target that only
+        acknowledges the REFER (202 + NOTIFY) without ever actually
+        placing the callback must stay at HIGH, not escalate --
+        confirms the plugin genuinely checks callback_confirmed, not
+        just whether confirm mode was requested."""
+        from voipaudit.plugins.refer_transfer_abuse import ReferTransferAbuseModule
+
+        server = start_mock_invite_responder(destination_behaviors={
+            "voipaudit-transfer-test": "answer_then_refer_accepted",
+        })
+        try:
+            eng = self._engagement(tmp_path)
+            result = ReferTransferAbuseModule(
+                eng, timeout=3.0, refer_wait_timeout=1.5,
+                confirm_reachable=True, callback_host="127.0.0.1",
+            ).run(f"127.0.0.1:{server.port}")
+            assert result.error is None
+            assert result.findings[0].severity.value == "HIGH"
+        finally:
+            server.stop()
+
     def test_rejected_transfer_reports_info(self, tmp_path):
         from voipaudit.plugins.refer_transfer_abuse import ReferTransferAbuseModule
 

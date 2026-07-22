@@ -145,9 +145,23 @@ def list_plugins():
                    "spoofed-identity probe. Defaults to --to-user itself (\"the destination calling "
                    "itself\") — set this to a specific known-trusted internal identity to test "
                    "instead (e.g. a reception or executive extension).")
+@click.option("--confirm-transfer-reachable", is_flag=True,
+              help="refer_transfer_abuse only: point Refer-To at a small SIP listener this tool runs "
+                   "itself instead of a synthetic extension on the target, to directly observe (not "
+                   "just infer from signalling) whether the target places a real callback call. "
+                   "Escalates the finding to CRITICAL when confirmed.")
+@click.option("--callback-host", default=None,
+              help="refer_transfer_abuse --confirm-transfer-reachable only: address the confirmation "
+                   "listener binds to and advertises in Refer-To. Defaults to auto-detecting the "
+                   "local outbound-routing IP toward the target; override for NAT/firewalled setups "
+                   "where that address isn't what the target can actually reach back on.")
+@click.option("--callback-port", default=0, show_default=True, type=int,
+              help="refer_transfer_abuse --confirm-transfer-reachable only: port for the confirmation "
+                   "listener. Defaults to an OS-assigned ephemeral port.")
 def scan(
     targets, authorization, audit_log, modules, confirm, timeout, transport, insecure, tls_port,
-    plaintext_port, json_output, to_user, spoof_from,
+    plaintext_port, json_output, to_user, spoof_from, confirm_transfer_reachable, callback_host,
+    callback_port,
 ):
     """Scan one or more SIP targets (host, host:port, or sip:/sips: URI)."""
     from voipaudit.core.authorization import AuthorizationError, load_authorization
@@ -260,6 +274,11 @@ def scan(
                     kwargs["to_user"] = to_user
                 if mod_name == "caller_id_spoofing" and spoof_from:
                     kwargs["spoof_from"] = spoof_from
+                if mod_name == "refer_transfer_abuse" and confirm_transfer_reachable:
+                    kwargs["confirm_reachable"] = True
+                    if callback_host:
+                        kwargs["callback_host"] = callback_host
+                    kwargs["callback_port"] = callback_port
                 plugin = plugin_cls(eng, **kwargs)
             else:
                 plugin = plugin_cls(eng, timeout=timeout, transport=transport, tls_verify=not insecure)

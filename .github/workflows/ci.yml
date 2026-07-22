@@ -552,5 +552,41 @@ jobs:
           kill $TRANSFER_MOCK_PID 2>/dev/null || true
           echo "::endgroup::"
 
+          echo "::group::scan — refer_transfer_abuse --confirm-transfer-reachable, real observed callback INVITE"
+          # Uses answer_then_honor_transfer, which -- unlike
+          # answer_then_refer_accepted above -- actually places a real
+          # new INVITE toward whatever Refer-To names, exactly like a
+          # real target that genuinely honors transfers would.
+          /tmp/smoke-venv/bin/python3 -c "
+          import sys, time
+          sys.path.insert(0, '$GITHUB_WORKSPACE')
+          from tests.fixtures.mock_pbx.invite_responder import start_mock_invite_responder
+          server = start_mock_invite_responder(destination_behaviors={'voipaudit-transfer-test': 'answer_then_honor_transfer'})
+          with open('/tmp/confirm_mock_port.txt', 'w') as f:
+              f.write(str(server.port))
+          time.sleep(30)
+          " > /tmp/confirm_mock.log 2>&1 &
+          CONFIRM_MOCK_PID=$!
+          for i in $(seq 1 20); do
+            if [ -f /tmp/confirm_mock_port.txt ]; then break; fi
+            sleep 0.5
+          done
+          CONFIRM_PORT=$(cat /tmp/confirm_mock_port.txt)
+          echo "Mock transfer-honoring responder on port $CONFIRM_PORT"
+
+          $VA scan "127.0.0.1:$CONFIRM_PORT" --modules refer_transfer_abuse --confirm ci-invite-test \
+            -a invite_authorization.yml --confirm-transfer-reachable --callback-host 127.0.0.1 \
+            --json /tmp/confirm_findings.json || true
+          cat /tmp/confirm_findings.json
+          python3 -c "
+          import json
+          findings = json.load(open('/tmp/confirm_findings.json'))
+          assert any(f['severity'] == 'CRITICAL' and 'confirmed' in f['title'].lower() for f in findings), f'expected a CRITICAL confirmed-callback finding not found: {findings}'
+          print(f'OK: {len(findings)} finding(s), including the expected CRITICAL confirmed-callback finding')
+          "
+
+          kill $CONFIRM_MOCK_PID 2>/dev/null || true
+          echo "::endgroup::"
+
           kill $MOCK_PID 2>/dev/null || true
           echo "All integration checks passed."
