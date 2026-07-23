@@ -588,5 +588,55 @@ jobs:
           kill $CONFIRM_MOCK_PID 2>/dev/null || true
           echo "::endgroup::"
 
+          echo "::group::scan --db, then dashboard — real SQLite persistence + a real HTTP request against the served page"
+          # A dedicated, fresh mock PBX for this section rather than
+          # reusing the original $PORT from much earlier in this script
+          # -- that one only lives 90s from its own startup, and by this
+          # point in a long-running job it may well have already exited.
+          /tmp/smoke-venv/bin/python3 -c "
+          import sys, time
+          sys.path.insert(0, '$GITHUB_WORKSPACE')
+          from tests.fixtures.mock_pbx.server import start_mock_pbx
+          server = start_mock_pbx(server_header='Asterisk PBX 18.9.0')
+          with open('/tmp/db_mock_port.txt', 'w') as f:
+              f.write(str(server.port))
+          time.sleep(30)
+          " > /tmp/db_mock.log 2>&1 &
+          DB_MOCK_PID=$!
+          for i in $(seq 1 20); do
+            if [ -f /tmp/db_mock_port.txt ]; then break; fi
+            sleep 0.5
+          done
+          DB_MOCK_PORT=$(cat /tmp/db_mock_port.txt)
+          echo "Mock PBX for --db test on port $DB_MOCK_PORT"
+
+          /tmp/smoke-venv/bin/pip install --quiet "$(echo "$GITHUB_WORKSPACE"/dist/*.whl)[dashboard]"
+          DB_PATH=$(mktemp -u --suffix=.db)
+          $VA scan "127.0.0.1:$DB_MOCK_PORT" --modules pbx_fingerprint --db "$DB_PATH"
+          python3 -c "
+          import sqlite3
+          conn = sqlite3.connect('$DB_PATH')
+          runs = conn.execute('SELECT * FROM runs').fetchall()
+          findings = conn.execute('SELECT * FROM findings').fetchall()
+          assert len(runs) == 1, f'expected 1 run, got {runs}'
+          assert len(findings) >= 1, f'expected at least 1 finding, got {findings}'
+          print(f'OK: {len(runs)} run(s), {len(findings)} finding(s) persisted to {\"$DB_PATH\"}')
+          "
+
+          $VA dashboard --db "$DB_PATH" --port 8123 > /tmp/dashboard.log 2>&1 &
+          DASHBOARD_PID=$!
+          for i in $(seq 1 20); do
+            if curl -s -o /dev/null "http://127.0.0.1:8123/"; then break; fi
+            sleep 0.5
+          done
+          INDEX_BODY=$(curl -s "http://127.0.0.1:8123/")
+          echo "$INDEX_BODY" | grep -q "ci-integration-test" || (echo "::error::expected engagement_id not found in dashboard index" && cat /tmp/dashboard.log && exit 1)
+          RUN_DETAIL=$(curl -s "http://127.0.0.1:8123/runs/1")
+          echo "$RUN_DETAIL" | grep -qi "asterisk" || (echo "::error::expected finding not found in run detail page" && exit 1)
+          API_RUNS=$(curl -s "http://127.0.0.1:8123/api/runs")
+          echo "$API_RUNS" | python3 -c "import json,sys; data=json.load(sys.stdin); assert len(data) == 1, data; print('OK: /api/runs returned', data)"
+          kill $DASHBOARD_PID 2>/dev/null || true
+          echo "::endgroup::"
+
           kill $MOCK_PID 2>/dev/null || true
           echo "All integration checks passed."

@@ -315,6 +315,42 @@ shift based on what turns out to matter most in practice.
   level one), HIGH when only the signalling-level "appears honored"
   evidence is available (confirm mode not requested), INFO otherwise.
 
+### v0.10.0
+- `scan --db PATH`: optionally persists every target's run and
+  findings to a SQLite database (`core/db.py`), matching the sibling
+  secureaudit/redteam-toolkit/loganalyzer repos' own SQLite-backed
+  history pattern. Deliberately separate from `core/audit_log.py`'s
+  existing hash-chained, tamper-evident log — that log proves exactly
+  what actions were taken (an integrity record); this is a plain,
+  mutable, queryable findings history meant to be browsed, not a
+  second copy of the same thing. Opt-in: without `--db`, nothing
+  changes.
+- New `dashboard` command: a read-only web UI
+  (`voipaudit/dashboard/app.py`, FastAPI) for browsing `--db`-persisted
+  history — a run list with per-severity finding counts, and a
+  per-run detail page. Also exposes a small GET-only JSON API
+  (`/api/runs`, `/api/runs/{id}/findings`) for programmatic access.
+  Deliberately GET-only everywhere — no route ever inserts, updates,
+  or deletes anything — and binds `127.0.0.1` by default: this serves
+  potentially sensitive engagement findings with no authentication of
+  its own, the same "operator's own trusted machine" assumption the
+  rest of this toolkit already makes for `authorization.yml` and the
+  audit log, not a hardened multi-user service.
+- HTML rendered through a Jinja2 `Environment(autoescape=True)`
+  (inline string templates, not file-based, to avoid needing
+  package-data/MANIFEST changes for a single small module) — mandatory,
+  not a style choice: finding titles/descriptions/evidence can embed
+  target-controlled data (e.g. a hostile PBX's own Server or From
+  header content, echoed back by `pbx_fingerprint`/
+  `caller_id_spoofing`), a real stored-XSS vector if ever rendered
+  unescaped. Verified directly: a finding with `<script>`/`<img
+  onerror=...>` content renders as inert escaped text, not executable
+  markup, both on the run-detail page and confirmed the index page
+  doesn't render raw finding text at all (only aggregate severity
+  counts, so it isn't a second copy of the same risk).
+- `jinja2` added to the existing `dashboard` extra (fastapi + uvicorn
+  were already there).
+
 ## Next
 
 ### TLS 1.3 pcap decryption support
@@ -329,8 +365,3 @@ turns up.
 `pbx_fingerprint`'s signature list is a reasonable starting set, not
 exhaustive. Extend as real-world Server/User-Agent strings turn up that
 aren't recognized yet.
-
-### Persistence + dashboard
-A `--db` flag to persist scan results (matching the sibling
-secureaudit/redteam-toolkit/loganalyzer repos' own SQLite-backed history
-pattern) and a read-only web dashboard to browse past engagements.
