@@ -610,7 +610,7 @@ jobs:
           DB_MOCK_PORT=$(cat /tmp/db_mock_port.txt)
           echo "Mock PBX for --db test on port $DB_MOCK_PORT"
 
-          /tmp/smoke-venv/bin/pip install --quiet "$(echo dist/*.whl)[dashboard]"
+          /tmp/smoke-venv/bin/pip install --quiet "$(echo "$GITHUB_WORKSPACE"/dist/*.whl)[dashboard]"
           DB_PATH=$(mktemp -u --suffix=.db)
           $VA scan "127.0.0.1:$DB_MOCK_PORT" --modules pbx_fingerprint --db "$DB_PATH"
           python3 -c "
